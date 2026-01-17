@@ -80,24 +80,32 @@ The `syncd` daemon is what actually writes to the ASIC_STATE database after rece
 │  - Serializes SAI API calls to Redis commands                               │
 │  - Manages communication mode (async/sync/zmq)                              │
 │  - Generates VID (Virtual ID) for new objects                               │
+│  - Writes CREATE COMMAND to request channel (NOT final ASIC_STATE entry)    │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                            ASIC_DB (Redis DB 1)                              │
-│  Key format: ASIC_STATE:SAI_OBJECT_TYPE_*|<oid>                             │
-│  - Stores serialized SAI objects and attributes                             │
-│  - Acts as IPC channel between orchagent and syncd                          │
+│                                                                             │
+│  REQUEST Channel/Key (written by sairedis, consumed by syncd):              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Command: CREATE                                                     │   │
+│  │  Object Type: SAI_OBJECT_TYPE_PORT                                   │   │
+│  │  VID: 0x1000000000003                                                │   │
+│  │  Attributes: lanes, speed, fec, etc.                                 │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                              SYNCD                                           │
 │  (syncd process - SAI daemon)                                               │
-│  - Consumes commands from ASIC_DB                                           │
+│  - Consumes commands from ASIC_DB request channel                           │
 │  - Translates to vendor-specific SAI implementation                         │
 │  - Maintains VID ↔ RID mapping                                              │
 │  - Programs actual ASIC hardware                                            │
+│  - Writes FINAL ASIC_STATE entry after successful creation                  │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
@@ -113,7 +121,41 @@ The `syncd` daemon is what actually writes to the ASIC_STATE database after rece
 │                            ASIC HARDWARE                                     │
 │  (Memory, TCAM, forwarding tables, etc.)                                    │
 └─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    ASIC_DB - FINAL STATE (written by syncd)                  │
+│                                                                             │
+│  ASIC_STATE Entry (after syncd processes and HW succeeds):                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Key: ASIC_STATE:SAI_OBJECT_TYPE_PORT|oid:0x1000000000003           │   │
+│  │    SAI_PORT_ATTR_HW_LANE_LIST: 1,2,3,4                               │   │
+│  │    SAI_PORT_ATTR_SPEED: 100000                                       │   │
+│  │    SAI_PORT_ATTR_OPER_STATUS: SAI_PORT_OPER_STATUS_UP                │   │
+│  │    ...                                                               │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  VID↔RID Mapping (internal to syncd, persisted for warm reboot):            │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  VIDTORID|oid:0x1000000000003 → oid:0x<actual_hardware_oid>         │   │
+│  │  RIDTOVID|oid:0x<actual_hardware_oid> → oid:0x1000000000003         │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+### Key Clarification: Request vs Final State
+
+**Q: Are the sairedis write and syncd write acting on the same DB table entry?**
+
+**A: No, they are different operations:**
+
+| Step | Component | What it writes | Purpose |
+|------|-----------|----------------|---------|
+| Request | sairedis | CREATE command to request channel/key | IPC to syncd |
+| Final State | syncd | ASIC_STATE:SAI_OBJECT_TYPE_PORT entry | Persistent state after HW success |
+
+The request channel is consumed by syncd and is transient. The ASIC_STATE entry is the final, persistent representation of the object after it has been successfully created in hardware.
 
 ---
 
