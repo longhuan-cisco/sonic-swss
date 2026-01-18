@@ -212,41 +212,89 @@ User Command: config interface shutdown Ethernet0
 | CONFIG_DB         |  PORT table updated: admin_status = down
 +-------------------+
          |
-         v (SubscriberStateTable)
+         v (SubscriberStateTable in portmgrd)
 +-------------------+
-| PortsOrch::       |  portsorch.cpp:4156 onwards
-| doPortTask()      |
+| PortMgr::doTask() |  cfgmgr/portmgr.cpp:138
 +-------------------+
          |
-         v (when admin_status field is processed)
+         v
 +-------------------+
-| PortsOrch::       |  portsorch.cpp:5156-5170
+| PortMgr::         |  cfgmgr/portmgr.cpp:60-84
 | setPortAdminStatus|
 +-------------------+
          |
-         v
-+-------------------+
-| sai_port_api->    |  portsorch.cpp:2125
-| set_port_attribute|  (SAI_PORT_ATTR_ADMIN_STATE = false)
-+-------------------+
-         |
-         v (SAI/SDK brings port down, generates notification)
-+-------------------+
-| SAI SDK           |  Hardware executes admin down
-+-------------------+
-         |
-         v (flows back through Path 1)
-   [Notification flow from SAI -> orchagent]
-         |
-         v
-+-------------------+
-| updatePortOperStatus|  portsorch.cpp:9041-9114
-+-------------------+
+         +---------------------------+
+         |                           |
+         v                           v
++-------------------+       +-------------------+
+| ip link set dev   |       | writeConfigToAppDb|  cfgmgr/portmgr.cpp:71
+| <port> down       |       | (APPL_DB)         |
++-------------------+       +-------------------+
+         |                           |
+         v                           v (SubscriberStateTable in orchagent)
++-------------------+       +-------------------+
+| Kernel netdev     |       | PortsOrch::       |  portsorch.cpp:5156-5170
+| state change      |       | doPortTask()      |
++-------------------+       +-------------------+
+         |                           |
+         v (netlink RTM_NEWLINK)     v
++-------------------+       +-------------------+
+| portsyncd         |       | PortsOrch::       |  portsorch.cpp:2106-2160
+| LinkSync::onMsg() |       | setPortAdminStatus|
++-------------------+       +-------------------+
+         |                           |
+         v                           v
++-------------------+       +-------------------+
+| STATE_DB          |       | sai_port_api->    |  portsorch.cpp:2125
+| admin_status      |       | set_port_attribute|  (SAI_PORT_ATTR_ADMIN_STATE)
+| netdev_oper_status|       +-------------------+
++-------------------+                |
+                                     v (SAI/SDK brings port down)
+                            +-------------------+
+                            | SAI SDK           |  Hardware executes admin down
+                            +-------------------+
+                                     |
+                                     v (SAI generates oper status notification)
+                            +-------------------+
+                            | updatePortOperStatus|  portsorch.cpp:9041-9114
+                            +-------------------+
 ```
 
 ### Key Code Path
 
-1. **CONFIG_DB Change Processing** (`portsorch.cpp:5156-5170`)
+1. **CONFIG_DB Change Received by portmgrd** (`portmgr.cpp:186-199`)
+   ```cpp
+   for (auto i : kfvFieldsValues(t))
+   {
+       if (fvField(i) == "admin_status")
+       {
+           admin_status = fvValue(i);
+       }
+   }
+   // ...
+   setPortAdminStatus(alias, admin_status == "up");
+   ```
+
+2. **portmgrd Sets Kernel Interface Down** (`portmgr.cpp:60-84`)
+   ```cpp
+   bool PortMgr::setPortAdminStatus(const string &alias, const bool up)
+   {
+       // ip link set dev <port_name> [up|down]
+       cmd << IP_CMD << " link set dev " << shellquote(alias) << (up ? " up" : " down");
+       int ret = swss::exec(cmd_str, res);
+       if (!ret)
+       {
+           // Write to APPL_DB after kernel command succeeds
+           return writeConfigToAppDb(alias, "admin_status", (up ? "up" : "down"));
+       }
+   }
+   ```
+
+3. **portsyncd Receives Netlink Event** (`linksync.cpp:111-206`)
+   - Kernel interface state change triggers RTM_NEWLINK
+   - portsyncd updates STATE_DB with `admin_status` and `netdev_oper_status`
+
+4. **portsorch Receives APPL_DB Change** (`portsorch.cpp:5156-5170`)
    ```cpp
    if (pCfg.admin_status.is_set)
    {
@@ -261,7 +309,7 @@ User Command: config interface shutdown Ethernet0
    }
    ```
 
-2. **Set Port Admin Status** (`portsorch.cpp:2106-2160`)
+5. **portsorch Calls SAI API** (`portsorch.cpp:2106-2160`)
    ```cpp
    bool PortsOrch::setPortAdminStatus(Port &port, bool state)
    {
@@ -269,23 +317,25 @@ User Command: config interface shutdown Ethernet0
        attr.id = SAI_PORT_ATTR_ADMIN_STATE;
        attr.value.booldata = state;
 
-       // Update host_tx_ready before admin down
-       if (!state && !m_cmisModuleAsicSyncSupported) {
-           setHostTxReady(port, "false");
-       }
-
        sai_status_t status = sai_port_api->set_port_attribute(port.m_port_id, &attr);
-
-       // Update host_tx_ready after admin up
-       if (state && status == SAI_STATUS_SUCCESS) {
-           setHostTxReady(port, "true");
-       }
-
        return true;
    }
    ```
 
-### Important Note: Admin Status vs Oper Status
+### Important Note: Parallel Paths
+
+When a user shuts down an interface, two parallel paths are triggered:
+
+1. **Kernel Path (portmgrd)**:
+   - `ip link set dev <port> down` → Kernel netdev goes down
+   - portsyncd receives netlink → Updates STATE_DB (`admin_status`, `netdev_oper_status`)
+
+2. **SAI/ASIC Path (portsorch)**:
+   - APPL_DB change → portsorch calls SAI API
+   - SAI/SDK brings ASIC port down → Generates oper status notification
+   - portsorch receives notification → Updates APPL_DB (`oper_status`)
+
+### Admin Status vs Oper Status
 
 - **Admin Status**: User-configurable. Can be set to UP/DOWN via CONFIG_DB.
 - **Oper Status**: Reflects actual link state. Determined by hardware.
@@ -523,6 +573,9 @@ User    CONFIG_DB    orchagent    SAI/SDK    syncd    ASIC_DB    (then back to o
 
 | Component | File | Line | Description |
 |-----------|------|------|-------------|
+| **portmgrd - CONFIG_DB handler** | `portmgr.cpp` | 138-250 | `doTask()` - receives CONFIG_DB changes |
+| **portmgrd - kernel admin set** | `portmgr.cpp` | 60-84 | `setPortAdminStatus()` - `ip link set dev <port> up/down` |
+| **portmgrd - APPL_DB write** | `portmgr.cpp` | 71, 252-260 | `writeConfigToAppDb()` - writes admin_status to APPL_DB |
 | SAI notification registration | `main.cpp` | 554-555 | Registers `on_port_state_change` callback |
 | Notification callback | `notifications.cpp` | 29-39 | Forwards to ASIC_DB NOTIFICATIONS |
 | Notification consumer | `portsorch.cpp` | 8879-8901 | `doTask(NotificationConsumer&)` |
@@ -530,7 +583,7 @@ User    CONFIG_DB    orchagent    SAI/SDK    syncd    ASIC_DB    (then back to o
 | **Central oper status update** | `portsorch.cpp` | 9041-9114 | `updatePortOperStatus()` |
 | APPL_DB oper_status update | `portsorch.cpp` | 3787-3802 | `updateDbPortOperStatus()` - writes to APPL_DB |
 | APPL_DB flap count update | `portsorch.cpp` | 3734-3762 | `updateDbPortFlapCount()` - writes to APPL_DB |
-| Admin status setting | `portsorch.cpp` | 2106-2160 | `setPortAdminStatus()` |
+| portsorch admin status (SAI) | `portsorch.cpp` | 2106-2160 | `setPortAdminStatus()` - calls SAI API |
 | Host interface oper status | `portsorch.cpp` | 3649-3671 | `setHostIntfsOperStatus()` |
 | **STATE_DB update (portsyncd)** | `linksync.cpp` | 197-205 | `m_statePortTable.set()` - netlink handler |
 | Next hop invalidation | `neighorch.cpp` | 523-555 | `ifChangeInformNextHop()` |
@@ -544,21 +597,26 @@ User    CONFIG_DB    orchagent    SAI/SDK    syncd    ASIC_DB    (then back to o
 
 1. **Two paths to oper status down:**
    - **Hardware-initiated (link failure):** Detected by SAI/SDK, notification sent through syncd to orchagent
-   - **User-initiated (admin shutdown):** CONFIG_DB change triggers SAI API call, which causes hardware to generate oper status notification
+   - **User-initiated (admin shutdown):** CONFIG_DB → portmgrd → kernel + APPL_DB → portsorch → SAI → notification
 
-2. **Central orchestration:** Both paths converge at `updatePortOperStatus()` which handles all downstream updates
+2. **User-initiated shutdown involves parallel paths:**
+   - **portmgrd**: `ip link set dev <port> down` → kernel netdev down → portsyncd → STATE_DB
+   - **portsorch**: APPL_DB change → SAI API → ASIC port down → SAI notification → APPL_DB
 
-3. **Database responsibility split:**
+3. **Central orchestration:** Both hardware and user-initiated paths converge at `updatePortOperStatus()` which handles all downstream updates
+
+4. **Component responsibilities:**
+   - **portmgrd** → Kernel interface control (`ip link set`), writes to APPL_DB
    - **portsyncd** → STATE_DB: `admin_status`, `netdev_oper_status` (from kernel netlink)
-   - **portsorch** → APPL_DB: `oper_status`, `flap_count`, `last_down_time` (from SAI notifications)
+   - **portsorch** → SAI API calls, APPL_DB: `oper_status`, `flap_count`, `last_down_time`
 
-4. **Downstream effects when port goes down:**
-   - APPL_DB updated with new oper_status and flap count (portsorch)
-   - STATE_DB updated with netdev_oper_status (portsyncd, after kernel state changes)
-   - Kernel netdev marked as DOWN via SAI hostif API
+5. **Downstream effects when port goes down:**
+   - Kernel netdev marked as DOWN (by portmgrd via `ip link set`)
+   - STATE_DB updated with admin_status, netdev_oper_status (portsyncd)
+   - APPL_DB updated with oper_status and flap count (portsorch)
    - Next hops marked with NHFLAGS_IFDOWN (routing updates)
    - FDB entries flushed (L2 cleanup)
    - Fine-grained ECMP groups updated
    - VOQ chassis state synchronized
 
-5. **Observer pattern:** PortsOrch uses the observer pattern to notify interested components (FdbOrch, FgNhgOrch) about state changes
+6. **Observer pattern:** PortsOrch uses the observer pattern to notify interested components (FdbOrch, FgNhgOrch) about state changes
