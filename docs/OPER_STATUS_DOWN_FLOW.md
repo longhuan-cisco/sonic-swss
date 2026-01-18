@@ -179,26 +179,6 @@ Physical Link Failure (cable unplugged, transceiver failure, remote side down)
                                                         | netdev_oper_status  |
                                                         | =down               |
                                                         +---------------------+
-
-         +---------------------------+
-         |                           |
-         v                           v
-+-------------------+       +-------------------+
-| notify(PORT_OPER_ |       | VOQ chassis:      |
-| STATE_CHANGE)     |       | voqSyncIntfState()|
-| (portsorch.cpp:   |       | (if gMySwitchType |
-|  9112-9113)       |       |  == "voq")        |
-+-------------------+       +-------------------+
-         |
-         +---------------------------+
-         |                           |
-         v                           v
-+-------------------+       +-------------------+
-| FdbOrch::update() |       | FgNhgOrch::       |
-| Flush FDB entries |       | update()          |
-| (fdborch.cpp:     |       | Update ECMP       |
-|  1204-1239)       |       | groups            |
-+-------------------+       +-------------------+
 ```
 
 ### Key Code Path
