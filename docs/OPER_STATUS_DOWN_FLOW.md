@@ -537,35 +537,106 @@ The interface state is synchronized across the chassis to all line cards.
 ### Sequence 1: Link Failure (Hardware-Initiated)
 
 ```
-Hardware    SAI/SDK    syncd    ASIC_DB    orchagent    STATE_DB    NeighOrch    FdbOrch
-   |           |         |         |           |            |           |           |
-   |--Link Down|         |         |           |            |           |           |
-   |           |--notify-|         |           |            |           |           |
-   |           |         |--pub--> |           |            |           |           |
-   |           |         |         |--sub----> |            |           |           |
-   |           |         |         |           |--update--> |           |           |
-   |           |         |         |           |            |           |           |
-   |           |         |         |           |---ifChangeInformNextHop->|           |
-   |           |         |         |           |            |           |           |
-   |           |         |         |           |---notify(PORT_OPER_STATE)-------->  |
-   |           |         |         |           |            |           |--flushFDB |
+Hardware    SAI/SDK    syncd    ASIC_DB    orchagent    APPL_DB    Kernel    portsyncd    STATE_DB
+   |           |         |         |           |            |          |          |           |
+   |--Link Down|         |         |           |            |          |          |           |
+   |           |--notify-|         |           |            |          |          |           |
+   |           |         |--pub--> |           |            |          |          |           |
+   |           |         |         |--sub----> |            |          |          |           |
+   |           |         |         |           |            |          |          |           |
+   |           |         |         |    updatePortOperStatus()         |          |           |
+   |           |         |         |           |--oper_status->        |          |           |
+   |           |         |         |           |            |          |          |           |
+   |           |         |         |           |--setHostIntfsOperStatus--------->|           |
+   |           |         |         |           |            |          |--netlink>|           |
+   |           |         |         |           |            |          |          |--update-->|
+   |           |         |         |           |            |          |          |(netdev_   |
+   |           |         |         |           |            |          |          | oper_status)
 ```
 
-### Sequence 2: Admin Shutdown (User-Initiated)
+### Sequence 2: Admin Shutdown (User-Initiated) - Detailed Timeline
+
+This diagram shows the two separate netlink events and STATE_DB updates:
 
 ```
-User    CONFIG_DB    orchagent    SAI/SDK    syncd    ASIC_DB    (then back to orchagent)
-  |         |            |           |         |          |
-  |--config-|            |           |         |          |
-  |         |--event---> |           |         |          |
-  |         |            |--set_attr->|         |          |
-  |         |            |(ADMIN_STATE)|        |          |
-  |         |            |           |--exec--> |          |
-  |         |            |           |--notify->|          |
-  |         |            |           |         |--pub----> |
-  |         |            |           |         |          |--sub-->orchagent
-  |         |            |           |         |          |   (updatePortOperStatus)
+Time  CONFIG_DB   portmgrd    Kernel     portsyncd   STATE_DB    APPL_DB    portsorch    SAI/SDK
+  |       |          |          |            |           |           |           |           |
+  |  admin_status    |          |            |           |           |           |           |
+  |   = down         |          |            |           |           |           |           |
+  |       |--------->|          |            |           |           |           |           |
+  |       |          |          |            |           |           |           |           |
+T1|       |    ip link set      |            |           |           |           |           |
+  |       |    dev <port> down  |            |           |           |           |           |
+  |       |          |--------->|            |           |           |           |           |
+  |       |          |  IFF_UP=0|            |           |           |           |           |
+  |       |          |          |            |           |           |           |           |
+T2|       |          |  RTM_NEWLINK #1       |           |           |           |           |
+  |       |          |          |----------->|           |           |           |           |
+  |       |          |          |            |           |           |           |           |
+T3|       |          |          |    STATE_DB update #1  |           |           |           |
+  |       |          |          |            |---------->|           |           |           |
+  |       |          |          |            | admin_status=down     |           |           |
+  |       |          |          |            | netdev_oper_status=up (unchanged) |           |
+  |       |          |          |            |           |           |           |           |
+  |       |    writeConfigToAppDb           |           |           |           |           |
+  |       |          |------------------------------------------->  |           |           |
+  |       |          |          |            |           | admin_status=down     |           |
+  |       |          |          |            |           |           |           |           |
+T4|       |          |          |            |           |           |<----------|           |
+  |       |          |          |            |           |           | (receives APPL_DB)    |
+  |       |          |          |            |           |           |           |           |
+T5|       |          |          |            |           |           |--setPortAdminStatus-->|
+  |       |          |          |            |           |           |  SAI_PORT_ATTR_       |
+  |       |          |          |            |           |           |  ADMIN_STATE=false    |
+  |       |          |          |            |           |           |           |           |
+T6|       |          |          |            |           |           |           |--ASIC---->|
+  |       |          |          |            |           |           |           | port down |
+  |       |          |          |            |           |           |           |           |
+T7|       |          |          |            |           |           |<--SAI notification----|
+  |       |          |          |            |           |           |  (oper_status=down)   |
+  |       |          |          |            |           |           |           |           |
+T8|       |          |          |            |           |           |           |           |
+  |       |          |          |            |           |  updatePortOperStatus()           |
+  |       |          |          |            |           |<--oper_status=down----|           |
+  |       |          |          |            |           |<--flap_count+1--------|           |
+  |       |          |          |            |           |           |           |           |
+T9|       |          |          |            |           |           |--setHostIntfsOperStatus
+  |       |          |          |            |           |           |  SAI_HOSTIF_ATTR_     |
+  |       |          |          |            |           |           |  OPER_STATUS=false    |
+  |       |          |<--------------------------------------------|           |           |
+  |       |          |IFF_RUNNING=0          |           |           |           |           |
+  |       |          |          |            |           |           |           |           |
+T10|      |          |  RTM_NEWLINK #2       |           |           |           |           |
+  |       |          |          |----------->|           |           |           |           |
+  |       |          |          |            |           |           |           |           |
+T11|      |          |          |    STATE_DB update #2  |           |           |           |
+  |       |          |          |            |---------->|           |           |           |
+  |       |          |          |            | admin_status=down     |           |           |
+  |       |          |          |            | netdev_oper_status=down           |           |
 ```
+
+### Timeline Summary for Admin Shutdown:
+
+| Time | Component | Action | Trigger |
+|------|-----------|--------|---------|
+| T1 | portmgrd | `ip link set dev <port> down` | CONFIG_DB change |
+| T2 | Kernel | Clears IFF_UP, sends RTM_NEWLINK #1 | ip link command |
+| T3 | portsyncd | STATE_DB: admin_status=down, netdev_oper_status=up | Netlink #1 |
+| T4 | portsorch | Receives APPL_DB change | portmgrd writeConfigToAppDb |
+| T5 | portsorch | Calls SAI setPortAdminStatus | APPL_DB change |
+| T6 | SAI/SDK | Brings ASIC port down | SAI API call |
+| T7 | SAI/SDK | Generates oper status notification | Hardware state change |
+| T8 | portsorch | updatePortOperStatus: APPL_DB oper_status=down | SAI notification |
+| T9 | portsorch | setHostIntfsOperStatus(false) | updatePortOperStatus |
+| T10 | Kernel | Clears IFF_RUNNING, sends RTM_NEWLINK #2 | SAI hostif API |
+| T11 | portsyncd | STATE_DB: admin_status=down, netdev_oper_status=down | Netlink #2 |
+
+### Key Points:
+
+1. **Two Netlink Events**: RTM_NEWLINK #1 (from portmgrd) and RTM_NEWLINK #2 (from portsorch)
+2. **Two STATE_DB Updates**: portsyncd updates STATE_DB twice - once per netlink event
+3. **Both fields updated together**: Each netlink event contains both IFF_UP and IFF_RUNNING flags
+4. **Trigger chain**: `setHostIntfsOperStatus()` → SAI hostif API → Kernel IFF_RUNNING change → Netlink → portsyncd → STATE_DB
 
 ---
 
