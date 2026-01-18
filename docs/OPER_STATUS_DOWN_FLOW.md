@@ -4,13 +4,14 @@ This document explains the operational status (oper status) down flow in SONiC S
 
 ## Table of Contents
 1. [Overview](#overview)
-2. [Key Data Structures](#key-data-structures)
-3. [Path 1: Oper Status Down Due to Link Failure](#path-1-oper-status-down-due-to-link-failure-hardware-initiated)
-4. [Path 2: Oper Status Down Due to User Shutdown](#path-2-oper-status-down-due-to-user-shutdown-admin-initiated)
-5. [Central Orchestration Function: updatePortOperStatus](#central-orchestration-function-updateportoperstatus)
-6. [Downstream Components Affected](#downstream-components-affected)
-7. [Sequence Diagrams](#sequence-diagrams)
-8. [Key Code References](#key-code-references)
+2. [Key Components and Their Responsibilities](#key-components-and-their-responsibilities)
+3. [Key Data Structures](#key-data-structures)
+4. [Path 1: Oper Status Down Due to Link Failure](#path-1-oper-status-down-due-to-link-failure-hardware-initiated)
+5. [Path 2: Oper Status Down Due to User Shutdown](#path-2-oper-status-down-due-to-user-shutdown-admin-initiated)
+6. [Central Orchestration Function: updatePortOperStatus](#central-orchestration-function-updateportoperstatus)
+7. [Downstream Components Affected](#downstream-components-affected)
+8. [Sequence Diagrams](#sequence-diagrams)
+9. [Key Code References](#key-code-references)
 
 ---
 
@@ -24,6 +25,51 @@ There are two distinct paths that lead to a port's operational status going down
 | Admin Shutdown | User configuration (CONFIG_DB) | CONFIG_DB -> portsorch -> SAI API -> SAI generates notification -> orchagent |
 
 Both paths ultimately converge at the `updatePortOperStatus()` function in portsorch.cpp, which handles all downstream updates.
+
+---
+
+## Key Components and Their Responsibilities
+
+### Database Updates by Component
+
+| Component | Database | Fields Updated | Source |
+|-----------|----------|----------------|--------|
+| **portsyncd** | STATE_DB | `admin_status`, `netdev_oper_status`, `state`, `mtu` | Linux kernel netlink (RTM_NEWLINK) |
+| **portsorch** | APPL_DB | `oper_status`, `flap_count`, `last_down_time`, `last_up_time` | SAI notifications |
+| **portsorch** | STATE_DB | `speed`, `fec`, `link_training_status`, `rmt_adv_speeds` | SAI attribute queries |
+
+### portsyncd Role (linksync.cpp)
+
+**portsyncd** listens to Linux kernel netlink events and updates **STATE_DB**:
+
+```cpp
+// linksync.cpp:197-205
+FieldValueTuple admin_status("admin_status", (admin ? "up" : "down"));   // from IFF_UP flag
+FieldValueTuple op("netdev_oper_status", oper ? "up" : "down");          // from IFF_RUNNING flag
+vector.push_back(admin_status);
+vector.push_back(op);
+m_statePortTable.set(key, vector);  // STATE_DB PORT_TABLE
+```
+
+- `admin_status`: Reflects kernel interface admin state (IFF_UP flag)
+- `netdev_oper_status`: Reflects kernel interface oper state (IFF_RUNNING flag)
+
+### portsorch Role (portsorch.cpp)
+
+**portsorch** receives SAI notifications and updates **APPL_DB**:
+
+```cpp
+// portsorch.cpp:3787-3802
+void PortsOrch::updateDbPortOperStatus(const Port& port, sai_port_oper_status_t status) const
+{
+    vector<FieldValueTuple> tuples;
+    FieldValueTuple tuple("oper_status", oper_status_strings.at(status));
+    tuples.push_back(tuple);
+    m_portTable->set(port.m_alias, tuples);  // APPL_DB PORT_TABLE
+}
+```
+
+- `oper_status`: Reflects SAI/ASIC port operational state
 
 ---
 
@@ -264,14 +310,14 @@ void PortsOrch::updatePortOperStatus(Port &port, sai_port_oper_status_t status)
     // 2. Skip if no change
     if (status == port.m_oper_status) return;
 
-    // 3. Update STATE_DB
+    // 3. Update APPL_DB with oper_status
     if (port.m_type == Port::PHY || port.m_type == Port::TUNNEL) {
-        updateDbPortOperStatus(port, status);
+        updateDbPortOperStatus(port, status);  // writes to APPL_DB PORT_TABLE
     }
 
-    // 4. Update flap count and timestamps
+    // 4. Update flap count and timestamps (APPL_DB)
     if (port.m_type == Port::PHY) {
-        updateDbPortFlapCount(port, status);
+        updateDbPortFlapCount(port, status);   // writes to APPL_DB PORT_TABLE
         updateGearboxPortOperStatus(port);
 
         // Refresh auto-negotiation state
@@ -287,7 +333,7 @@ void PortsOrch::updatePortOperStatus(Port &port, sai_port_oper_status_t status)
     // 5. Update internal state
     port.m_oper_status = status;
 
-    // 6. Update host interface (kernel netdev)
+    // 6. Update host interface (kernel netdev) - this triggers portsyncd to update STATE_DB
     bool isUp = status == SAI_PORT_OPER_STATUS_UP;
     if (port.m_type == Port::PHY) {
         setHostIntfsOperStatus(port, isUp);  // portsorch.cpp:3649
@@ -318,10 +364,16 @@ void PortsOrch::updatePortOperStatus(Port &port, sai_port_oper_status_t status)
 
 When a port goes operationally down, the following components are notified/updated:
 
-### 1. STATE_DB Updates
+### 1. Database Updates
+
+**APPL_DB** (updated by portsorch via `updateDbPortOperStatus` and `updateDbPortFlapCount`):
 - `PORT_TABLE|<port_name>`: `oper_status` field updated to "down"
 - `PORT_TABLE|<port_name>`: `flap_count` incremented
 - `PORT_TABLE|<port_name>`: `last_down_time` timestamp updated
+
+**STATE_DB** (updated by portsyncd via netlink events):
+- `PORT_TABLE|<port_name>`: `netdev_oper_status` updated when kernel interface state changes
+- `PORT_TABLE|<port_name>`: `admin_status` updated when kernel admin state changes
 
 ### 2. Host Interface (Kernel netdev)
 **File:** `portsorch.cpp:3649-3671`
@@ -476,8 +528,11 @@ User    CONFIG_DB    orchagent    SAI/SDK    syncd    ASIC_DB    (then back to o
 | Notification consumer | `portsorch.cpp` | 8879-8901 | `doTask(NotificationConsumer&)` |
 | Notification handling | `portsorch.cpp` | 8903-8969 | `handleNotification()` |
 | **Central oper status update** | `portsorch.cpp` | 9041-9114 | `updatePortOperStatus()` |
+| APPL_DB oper_status update | `portsorch.cpp` | 3787-3802 | `updateDbPortOperStatus()` - writes to APPL_DB |
+| APPL_DB flap count update | `portsorch.cpp` | 3734-3762 | `updateDbPortFlapCount()` - writes to APPL_DB |
 | Admin status setting | `portsorch.cpp` | 2106-2160 | `setPortAdminStatus()` |
 | Host interface oper status | `portsorch.cpp` | 3649-3671 | `setHostIntfsOperStatus()` |
+| **STATE_DB update (portsyncd)** | `linksync.cpp` | 197-205 | `m_statePortTable.set()` - netlink handler |
 | Next hop invalidation | `neighorch.cpp` | 523-555 | `ifChangeInformNextHop()` |
 | FDB flush | `fdborch.cpp` | 1204-1239 | `updatePortOperState()` |
 | Observer pattern | `portsorch.cpp` | 9112-9113 | `notify(SUBJECT_TYPE_PORT_OPER_STATE_CHANGE)` |
@@ -493,12 +548,17 @@ User    CONFIG_DB    orchagent    SAI/SDK    syncd    ASIC_DB    (then back to o
 
 2. **Central orchestration:** Both paths converge at `updatePortOperStatus()` which handles all downstream updates
 
-3. **Downstream effects when port goes down:**
-   - STATE_DB updated with new status and flap count
-   - Kernel netdev marked as DOWN
+3. **Database responsibility split:**
+   - **portsyncd** → STATE_DB: `admin_status`, `netdev_oper_status` (from kernel netlink)
+   - **portsorch** → APPL_DB: `oper_status`, `flap_count`, `last_down_time` (from SAI notifications)
+
+4. **Downstream effects when port goes down:**
+   - APPL_DB updated with new oper_status and flap count (portsorch)
+   - STATE_DB updated with netdev_oper_status (portsyncd, after kernel state changes)
+   - Kernel netdev marked as DOWN via SAI hostif API
    - Next hops marked with NHFLAGS_IFDOWN (routing updates)
    - FDB entries flushed (L2 cleanup)
    - Fine-grained ECMP groups updated
    - VOQ chassis state synchronized
 
-4. **Observer pattern:** PortsOrch uses the observer pattern to notify interested components (FdbOrch, FgNhgOrch) about state changes
+5. **Observer pattern:** PortsOrch uses the observer pattern to notify interested components (FdbOrch, FgNhgOrch) about state changes
