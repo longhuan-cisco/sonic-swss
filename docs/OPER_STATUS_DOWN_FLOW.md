@@ -234,22 +234,22 @@ User Command: config interface shutdown Ethernet0
          v                           v (SubscriberStateTable in orchagent)
 +-------------------+       +-------------------+
 | Kernel netdev     |       | PortsOrch::       |  portsorch.cpp:5156-5170
-| state change      |       | doPortTask()      |
+| IFF_UP = 0        |       | doPortTask()      |
 +-------------------+       +-------------------+
          |                           |
-         v (netlink RTM_NEWLINK)     v
+         v (netlink RTM_NEWLINK #1)  v
 +-------------------+       +-------------------+
 | portsyncd         |       | PortsOrch::       |  portsorch.cpp:2106-2160
 | LinkSync::onMsg() |       | setPortAdminStatus|
 +-------------------+       +-------------------+
          |                           |
          v                           v
-+-------------------+       +-------------------+
-| STATE_DB          |       | sai_port_api->    |  portsorch.cpp:2125
-| admin_status      |       | set_port_attribute|  (SAI_PORT_ATTR_ADMIN_STATE)
-| netdev_oper_status|       +-------------------+
-+-------------------+                |
-                                     v (SAI/SDK brings port down)
++---------------------+     +-------------------+
+| STATE_DB update #1  |     | sai_port_api->    |  portsorch.cpp:2125
+| admin_status=down   |     | set_port_attribute|  (SAI_PORT_ATTR_ADMIN_STATE)
+| netdev_oper_status  |     +-------------------+
+| =up (unchanged)     |              |
++---------------------+              v (SAI/SDK brings port down)
                             +-------------------+
                             | SAI SDK           |  Hardware executes admin down
                             +-------------------+
@@ -258,6 +258,36 @@ User Command: config interface shutdown Ethernet0
                             +-------------------+
                             | updatePortOperStatus|  portsorch.cpp:9041-9114
                             +-------------------+
+                                     |
+         +---------------------------+---------------------------+
+         |                           |                           |
+         v                           v                           v
++-------------------+       +-------------------+       +-------------------+
+| APPL_DB           |       | APPL_DB           |       | setHostIntfsOper  |
+| oper_status=down  |       | flap_count++      |       | Status(false)     |
+| (portsorch.cpp:   |       | last_down_time    |       | (portsorch.cpp:   |
+|  3787-3802)       |       | (portsorch.cpp:   |       |  3649-3671)       |
++-------------------+       |  3734-3762)       |       +-------------------+
+                            +-------------------+                |
+                                                                 v
+                                                        +-------------------+
+                                                        | SAI hostif API    |
+                                                        | IFF_RUNNING = 0   |
+                                                        +-------------------+
+                                                                 |
+                                                                 v (netlink RTM_NEWLINK #2)
+                                                        +-------------------+
+                                                        | portsyncd         |
+                                                        | LinkSync::onMsg() |
+                                                        +-------------------+
+                                                                 |
+                                                                 v
+                                                        +---------------------+
+                                                        | STATE_DB update #2  |
+                                                        | admin_status=down   |
+                                                        | netdev_oper_status  |
+                                                        | =down               |
+                                                        +---------------------+
 ```
 
 ### Key Code Path
@@ -596,9 +626,11 @@ T7|       |          |          |            |           |           |<--SAI not
   |       |          |          |            |           |           |  (oper_status=down)   |
   |       |          |          |            |           |           |           |           |
 T8|       |          |          |            |           |           |           |           |
-  |       |          |          |            |           |  updatePortOperStatus()           |
-  |       |          |          |            |           |<--oper_status=down----|           |
-  |       |          |          |            |           |<--flap_count+1--------|           |
+  |       |          |          |            |           |   updatePortOperStatus()          |
+  |       |          |          |            |           |   portsorch writes to APPL_DB:    |
+  |       |          |          |            |           |     - oper_status = down          |
+  |       |          |          |            |           |     - flap_count++                |
+  |       |          |          |            |           |     - last_down_time              |
   |       |          |          |            |           |           |           |           |
 T9|       |          |          |            |           |           |--setHostIntfsOperStatus
   |       |          |          |            |           |           |  SAI_HOSTIF_ATTR_     |
@@ -626,7 +658,7 @@ T11|      |          |          |    STATE_DB update #2  |           |          
 | T5 | portsorch | Calls SAI setPortAdminStatus | APPL_DB change |
 | T6 | SAI/SDK | Brings ASIC port down | SAI API call |
 | T7 | SAI/SDK | Generates oper status notification | Hardware state change |
-| T8 | portsorch | updatePortOperStatus: APPL_DB oper_status=down | SAI notification |
+| T8 | portsorch | **updatePortOperStatus: writes APPL_DB** (oper_status=down, flap_count++, last_down_time) | SAI notification |
 | T9 | portsorch | setHostIntfsOperStatus(false) | updatePortOperStatus |
 | T10 | Kernel | Clears IFF_RUNNING, sends RTM_NEWLINK #2 | SAI hostif API |
 | T11 | portsyncd | STATE_DB: admin_status=down, netdev_oper_status=down | Netlink #2 |
