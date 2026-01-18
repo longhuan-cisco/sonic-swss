@@ -2,16 +2,19 @@
 
 This document explains the operational status (oper status) down flow in SONiC SWSS, covering both hardware-initiated (link failure) and user-initiated (admin shutdown) scenarios.
 
+> **Note:** This document describes the **default Redis async communication mode** (`SAI_REDIS_COMMUNICATION_MODE_REDIS_ASYNC`), which is used by most production deployments. Some platforms (e.g., Nvidia/Mellanox) use ZMQ mode (`SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC`) which has a slightly different notification path. See [Communication Modes](#communication-modes) for details.
+
 ## Table of Contents
 1. [Overview](#overview)
-2. [Key Components and Their Responsibilities](#key-components-and-their-responsibilities)
-3. [Key Data Structures](#key-data-structures)
-4. [Path 1: Oper Status Down Due to Link Failure](#path-1-oper-status-down-due-to-link-failure-hardware-initiated)
-5. [Path 2: Oper Status Down Due to User Shutdown](#path-2-oper-status-down-due-to-user-shutdown-admin-initiated)
-6. [Central Orchestration Function: updatePortOperStatus](#central-orchestration-function-updateportoperstatus)
-7. [Downstream Components Affected](#downstream-components-affected)
-8. [Sequence Diagrams](#sequence-diagrams)
-9. [Key Code References](#key-code-references)
+2. [Communication Modes](#communication-modes)
+3. [Key Components and Their Responsibilities](#key-components-and-their-responsibilities)
+4. [Key Data Structures](#key-data-structures)
+5. [Path 1: Oper Status Down Due to Link Failure](#path-1-oper-status-down-due-to-link-failure-hardware-initiated)
+6. [Path 2: Oper Status Down Due to User Shutdown](#path-2-oper-status-down-due-to-user-shutdown-admin-initiated)
+7. [Central Orchestration Function: updatePortOperStatus](#central-orchestration-function-updateportoperstatus)
+8. [Downstream Components Affected](#downstream-components-affected)
+9. [Sequence Diagrams](#sequence-diagrams)
+10. [Key Code References](#key-code-references)
 
 ---
 
@@ -25,6 +28,36 @@ There are two distinct paths that lead to a port's operational status going down
 | Admin Shutdown | User configuration (CONFIG_DB) | CONFIG_DB -> portsorch -> SAI API -> SAI generates notification -> orchagent |
 
 Both paths ultimately converge at the `updatePortOperStatus()` function in portsorch.cpp, which handles all downstream updates.
+
+---
+
+## Communication Modes
+
+SONiC supports different communication modes between orchagent and syncd, configured via `gRedisCommunicationMode` (`orchagent/main.cpp:58`):
+
+| Mode | Description | Default? |
+|------|-------------|----------|
+| `SAI_REDIS_COMMUNICATION_MODE_REDIS_ASYNC` | Redis with pipelining (async) | **Yes** |
+| `SAI_REDIS_COMMUNICATION_MODE_REDIS_SYNC` | Redis synchronous (deprecated) | No |
+| `SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC` | ZeroMQ direct communication | No |
+
+### How Notifications Work in Each Mode
+
+**Default Mode (Redis Async)** - Described in this document:
+```
+Hardware → SAI SDK → syncd (sonic-sairedis) → ASIC_DB NOTIFICATIONS → orchagent
+                     ↑
+                     syncd publishes to Redis pub/sub
+```
+In this mode, **syncd** (from the sonic-sairedis repository) receives SAI notifications and publishes them to the ASIC_DB "NOTIFICATIONS" channel. The callbacks in `orchagent/notifications.cpp` are registered but do nothing for port state changes.
+
+**ZMQ Mode** (used by some vendors like Nvidia/Mellanox):
+```
+Hardware → SAI SDK → libsairedis callback → orchagent/notifications.cpp → ASIC_DB NOTIFICATIONS → portsorch
+                                            ↑
+                                            Callback forwards to Redis (workaround for thread safety)
+```
+In ZMQ mode, SAI notifications arrive directly at orchagent via registered callbacks. Since these callbacks run in a separate libsairedis thread (causing concurrency issues), they forward notifications to the same ASIC_DB NOTIFICATIONS channel as a workaround (`notifications.cpp:31-39`).
 
 ---
 
@@ -115,18 +148,13 @@ Physical Link Failure (cable unplugged, transceiver failure, remote side down)
 |   SAI/SDK Layer   |  Hardware detects link loss
 +-------------------+
          |
-         v (callback registered in main.cpp:554-555)
+         v (SAI notification callback)
 +-------------------+
-| on_port_state_    |  notifications.cpp:29
-| change()          |
-+-------------------+
-         |
-         v (sends to ASIC_DB NOTIFICATIONS channel)
-+-------------------+
-| NotificationProducer |  notifications.cpp:33-39
+| syncd             |  sonic-sairedis repository
+| (NotificationHandler) |
 +-------------------+
          |
-         v
+         v (publishes to Redis pub/sub)
 +-------------------+
 | ASIC_DB           |  Redis pub/sub channel "NOTIFICATIONS"
 | NOTIFICATIONS     |
@@ -140,7 +168,7 @@ Physical Link Failure (cable unplugged, transceiver failure, remote side down)
          |
          v
 +-------------------+
-| PortsOrch::       |  portsorch.cpp:8903-8969
+| PortsOrch::       |  portsorch.cpp:8903-8974
 | handleNotification|
 +-------------------+
          |
@@ -183,21 +211,17 @@ Physical Link Failure (cable unplugged, transceiver failure, remote side down)
 
 ### Key Code Path
 
-1. **SAI Notification Registration** (`main.cpp:554-555`)
+1. **SAI Notification Registration** (`orchagent/main.cpp:554-555`)
    ```cpp
    attr.id = SAI_SWITCH_ATTR_PORT_STATE_CHANGE_NOTIFY;
    attr.value.ptr = (void *)on_port_state_change;
    ```
 
-2. **Notification Callback** (`notifications.cpp:29-39`)
-   ```cpp
-   void on_port_state_change(uint32_t count, sai_port_oper_status_notification_t *data)
-   {
-       swss::NotificationProducer port_state_change(&db, "NOTIFICATIONS");
-       std::string sdata = sai_serialize_port_oper_status_ntf(count, data);
-       port_state_change.send("port_state_change", sdata, values);
-   }
-   ```
+2. **syncd Publishes Notification** (sonic-sairedis repository)
+
+   In default Redis async mode, syncd receives the SAI notification and publishes it to the ASIC_DB "NOTIFICATIONS" channel via Redis pub/sub.
+
+   > **Note:** The callback in `orchagent/notifications.cpp:29-41` is registered but **does nothing** in default mode due to the `if (gRedisCommunicationMode == SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC)` guard. It only actively forwards notifications in ZMQ mode.
 
 3. **NotificationConsumer Processing** (`portsorch.cpp:8879-8901`)
    ```cpp
@@ -703,23 +727,23 @@ T11|      |          |          |    STATE_DB update #2  |           |          
 
 | Component | File | Line | Description |
 |-----------|------|------|-------------|
-| **portmgrd - CONFIG_DB handler** | `portmgr.cpp` | 138-250 | `doTask()` - receives CONFIG_DB changes |
-| **portmgrd - kernel admin set** | `portmgr.cpp` | 60-84 | `setPortAdminStatus()` - `ip link set dev <port> up/down` |
-| **portmgrd - APPL_DB write** | `portmgr.cpp` | 71, 252-260 | `writeConfigToAppDb()` - writes admin_status to APPL_DB |
-| SAI notification registration | `main.cpp` | 554-555 | Registers `on_port_state_change` callback |
-| Notification callback | `notifications.cpp` | 29-39 | Forwards to ASIC_DB NOTIFICATIONS |
-| Notification consumer | `portsorch.cpp` | 8879-8901 | `doTask(NotificationConsumer&)` |
-| Notification handling | `portsorch.cpp` | 8903-8969 | `handleNotification()` |
-| **Central oper status update** | `portsorch.cpp` | 9041-9114 | `updatePortOperStatus()` |
-| APPL_DB oper_status update | `portsorch.cpp` | 3787-3802 | `updateDbPortOperStatus()` - writes to APPL_DB |
-| APPL_DB flap count update | `portsorch.cpp` | 3734-3762 | `updateDbPortFlapCount()` - writes to APPL_DB |
-| portsorch admin status (SAI) | `portsorch.cpp` | 2106-2160 | `setPortAdminStatus()` - calls SAI API |
-| Host interface oper status | `portsorch.cpp` | 3649-3671 | `setHostIntfsOperStatus()` |
-| **STATE_DB update (portsyncd)** | `linksync.cpp` | 197-205 | `m_statePortTable.set()` - netlink handler |
-| Next hop invalidation | `neighorch.cpp` | 523-555 | `ifChangeInformNextHop()` |
-| FDB flush | `fdborch.cpp` | 1204-1239 | `updatePortOperState()` |
-| Observer pattern | `portsorch.cpp` | 9112-9113 | `notify(SUBJECT_TYPE_PORT_OPER_STATE_CHANGE)` |
-| Observer registration | `fdborch.cpp` | 39 | `m_portsOrch->attach(this)` |
+| **portmgrd - CONFIG_DB handler** | `cfgmgr/portmgr.cpp` | 138-250 | `doTask()` - receives CONFIG_DB changes |
+| **portmgrd - kernel admin set** | `cfgmgr/portmgr.cpp` | 60-84 | `setPortAdminStatus()` - `ip link set dev <port> up/down` |
+| **portmgrd - APPL_DB write** | `cfgmgr/portmgr.cpp` | 71, 252-260 | `writeConfigToAppDb()` - writes admin_status to APPL_DB |
+| SAI notification registration | `orchagent/main.cpp` | 554-555 | Registers `on_port_state_change` callback |
+| Notification callback (ZMQ only) | `orchagent/notifications.cpp` | 29-41 | Forwards to ASIC_DB NOTIFICATIONS (only in ZMQ mode) |
+| Notification consumer | `orchagent/portsorch.cpp` | 8879-8901 | `doTask(NotificationConsumer&)` |
+| Notification handling | `orchagent/portsorch.cpp` | 8903-8974 | `handleNotification()` |
+| **Central oper status update** | `orchagent/portsorch.cpp` | 9041-9114 | `updatePortOperStatus()` |
+| APPL_DB oper_status update | `orchagent/portsorch.cpp` | 3787-3802 | `updateDbPortOperStatus()` - writes to APPL_DB |
+| APPL_DB flap count update | `orchagent/portsorch.cpp` | 3734-3762 | `updateDbPortFlapCount()` - writes to APPL_DB |
+| portsorch admin status (SAI) | `orchagent/portsorch.cpp` | 2106-2160 | `setPortAdminStatus()` - calls SAI API |
+| Host interface oper status | `orchagent/portsorch.cpp` | 3649-3671 | `setHostIntfsOperStatus()` |
+| **STATE_DB update (portsyncd)** | `portsyncd/linksync.cpp` | 197-205 | `m_statePortTable.set()` - netlink handler |
+| Next hop invalidation | `orchagent/neighorch.cpp` | 523-555 | `ifChangeInformNextHop()` |
+| FDB flush | `orchagent/fdborch.cpp` | 1204-1239 | `updatePortOperState()` |
+| Observer pattern | `orchagent/portsorch.cpp` | 9112-9113 | `notify(SUBJECT_TYPE_PORT_OPER_STATE_CHANGE)` |
+| Observer registration | `orchagent/fdborch.cpp` | 39 | `m_portsOrch->attach(this)` |
 
 ---
 
