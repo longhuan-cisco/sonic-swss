@@ -108,7 +108,7 @@ This flow is triggered when the physical link fails (e.g., cable unplugged, tran
 ### Flow Diagram
 
 ```
-Physical Link Failure
+Physical Link Failure (cable unplugged, transceiver failure, remote side down)
          |
          v
 +-------------------+
@@ -150,8 +150,55 @@ Physical Link Failure
 | updatePortOperStatus|
 +-------------------+
          |
-         v
-   [Downstream Updates]
+         +---------------------------+---------------------------+---------------------------+
+         |                           |                           |                           |
+         v                           v                           v                           v
++-------------------+       +-------------------+       +-------------------+       +-------------------+
+| APPL_DB           |       | APPL_DB           |       | setHostIntfsOper  |       | gNeighOrch->      |
+| oper_status=down  |       | flap_count++      |       | Status(false)     |       | ifChangeInform    |
+| (portsorch.cpp:   |       | last_down_time    |       | (portsorch.cpp:   |       | NextHop()         |
+|  3787-3802)       |       | (portsorch.cpp:   |       |  3649-3671)       |       | (neighorch.cpp:   |
++-------------------+       |  3734-3762)       |       +-------------------+       |  523-555)         |
+                            +-------------------+                |                  +-------------------+
+                                                                 |                           |
+                                                                 v                           v
+                                                        +-------------------+       +-------------------+
+                                                        | SAI hostif API    |       | Mark next hops    |
+                                                        | IFF_RUNNING = 0   |       | with NHFLAGS_     |
+                                                        +-------------------+       | IFDOWN            |
+                                                                 |                  +-------------------+
+                                                                 v (netlink RTM_NEWLINK)
+                                                        +-------------------+
+                                                        | portsyncd         |
+                                                        | LinkSync::onMsg() |
+                                                        +-------------------+
+                                                                 |
+                                                                 v
+                                                        +---------------------+
+                                                        | STATE_DB            |
+                                                        | netdev_oper_status  |
+                                                        | =down               |
+                                                        +---------------------+
+
+         +---------------------------+
+         |                           |
+         v                           v
++-------------------+       +-------------------+
+| notify(PORT_OPER_ |       | VOQ chassis:      |
+| STATE_CHANGE)     |       | voqSyncIntfState()|
+| (portsorch.cpp:   |       | (if gMySwitchType |
+|  9112-9113)       |       |  == "voq")        |
++-------------------+       +-------------------+
+         |
+         +---------------------------+
+         |                           |
+         v                           v
++-------------------+       +-------------------+
+| FdbOrch::update() |       | FgNhgOrch::       |
+| Flush FDB entries |       | update()          |
+| (fdborch.cpp:     |       | Update ECMP       |
+|  1204-1239)       |       | groups            |
++-------------------+       +-------------------+
 ```
 
 ### Key Code Path
