@@ -152,10 +152,52 @@ The `syncd` daemon is what actually writes to the ASIC_STATE database after rece
 
 | Step | Component | What it writes | Purpose |
 |------|-----------|----------------|---------|
-| Request | sairedis | CREATE command to request channel/key | IPC to syncd |
-| Final State | syncd | ASIC_STATE:SAI_OBJECT_TYPE_PORT entry | Persistent state after HW success |
+| Request | sairedis | CREATE/REMOVE command to request channel/key | IPC to syncd |
+| Final State | syncd | Creates/Deletes ASIC_STATE:SAI_OBJECT_TYPE_PORT entry | Persistent state after HW success |
 
-The request channel is consumed by syncd and is transient. The ASIC_STATE entry is the final, persistent representation of the object after it has been successfully created in hardware.
+The request channel is consumed by syncd and is transient. The ASIC_STATE entry is the final, persistent representation of the object after it has been successfully created/deleted in hardware.
+
+### Deletion Flow (Similar Pattern)
+
+Port deletion follows the same pattern as creation:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              DELETION FLOW                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. orchagent: sai_port_api->remove_ports()                                 │
+│          │                                                                  │
+│          ▼                                                                  │
+│  2. sairedis: Writes REMOVE command to request channel                      │
+│          │     (ASIC_STATE entry still exists at this point)                │
+│          │                                                                  │
+│          ├─────────────────────────────────────►  3. syncd receives request │
+│          │                                                │                 │
+│          │                                                ▼                 │
+│  4. Returns to caller                             5. Calls ASIC SDK         │
+│     (ASYNC: immediate)                               remove_port()          │
+│     (SYNC: waits)                                         │                 │
+│          │                                                ▼                 │
+│          │                                        6. ASIC SDK returns       │
+│          │                                           SUCCESS                │
+│          │                                                │                 │
+│          │                                                ▼                 │
+│          │                                        7. syncd DELETES          │
+│          │                                           ASIC_STATE entry       │
+│          │                                                │                 │
+│          │                                                ▼                 │
+│          │◄───────────────────────────────────────8. Response: STATUS       │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Key Point:** The ASIC_STATE entry is only deleted **after** the ASIC SDK successfully removes the object from hardware. If the ASIC SDK fails, the entry remains in ASIC_STATE.
+
+| Operation | Request (sairedis) | Final Action (syncd) | When ASIC_STATE changes |
+|-----------|-------------------|---------------------|------------------------|
+| **Create** | CREATE command to request channel | Creates ASIC_STATE entry | After ASIC SDK succeeds |
+| **Delete** | REMOVE command to request channel | Deletes ASIC_STATE entry | After ASIC SDK succeeds |
 
 ---
 
