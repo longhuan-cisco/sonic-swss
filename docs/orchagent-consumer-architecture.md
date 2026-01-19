@@ -10,9 +10,11 @@ This document explains how orchagent consumes data from Redis databases using Co
 4. [ConsumerStateTable vs SubscriberStateTable](#consumerstatetable-vs-subscriberstatetable)
 5. [ConsumerStateTable Deep Dive](#consumerstatetable-deep-dive)
 6. [SubscriberStateTable Deep Dive](#subscriberstatetable-deep-dive)
-7. [Redis Data Structures](#redis-data-structures)
-8. [Producer-Consumer Model](#producer-consumer-model)
-9. [Code References](#code-references)
+7. [Redis Notification Mechanisms](#redis-notification-mechanisms)
+8. [Reliability Comparison](#reliability-comparison)
+9. [Redis Data Structures](#redis-data-structures)
+10. [Producer-Consumer Model](#producer-consumer-model)
+11. [Code References](#code-references)
 
 ---
 
@@ -332,6 +334,284 @@ void SubscriberStateTable::pops(...) {
         vkco.push_back(kco);
     }
 }
+```
+
+---
+
+## Redis Notification Mechanisms
+
+SONiC uses two different Redis notification mechanisms. Understanding their differences is crucial for understanding the reliability trade-offs.
+
+### Redis Pub/Sub (used by ConsumerStateTable)
+
+**Explicit messaging** - producer must explicitly publish.
+
+```
+Producer:                              Consumer:
+PUBLISH PORT_TABLE_CHANNEL@0 "G"  ──►  SUBSCRIBE PORT_TABLE_CHANNEL@0
+```
+
+#### Characteristics
+
+| Aspect | Description |
+|--------|-------------|
+| **Trigger** | Explicit `PUBLISH` command by producer |
+| **Content** | Producer controls message content (SONiC uses `"G"`) |
+| **Channel** | Custom channel name: `TABLE_CHANNEL@N` |
+| **Coupling** | Producer must know to publish |
+| **Used by** | `ProducerStateTable` → `ConsumerStateTable` |
+
+#### Example
+
+```bash
+# Producer
+redis-cli PUBLISH PORT_TABLE_CHANNEL@0 "G"
+
+# Consumer receives:
+1) "message"
+2) "PORT_TABLE_CHANNEL@0"
+3) "G"                        # Just a signal, no useful data
+```
+
+### Redis Keyspace Notifications (used by SubscriberStateTable)
+
+**Automatic notifications** - Redis automatically notifies when keys change.
+
+```
+Any client:                            Consumer:
+HSET PORT|Eth0 speed 100000  ──►  Redis auto-generates notification
+                                       │
+                                       ▼
+                              PSUBSCRIBE __keyspace@4__:PORT|*
+```
+
+#### Characteristics
+
+| Aspect | Description |
+|--------|-------------|
+| **Trigger** | Automatic on any key modification |
+| **Content** | Contains key name and operation type |
+| **Channel** | Auto-generated: `__keyspace@N__:TABLE\|key` |
+| **Coupling** | No producer awareness needed |
+| **Used by** | Any writer → `SubscriberStateTable` |
+
+#### Example
+
+```bash
+# Any client writes to Redis
+redis-cli HSET "PORT|Ethernet0" speed 100000
+
+# Consumer receives (automatic):
+1) "pmessage"
+2) "__keyspace@4__:PORT|*"              # Pattern subscribed
+3) "__keyspace@4__:PORT|Ethernet0"      # Actual key that changed
+4) "hset"                               # Operation type
+```
+
+#### Must Be Enabled in Redis
+
+```bash
+# Enable keyspace notifications (CONFIG_DB uses this)
+redis-cli CONFIG SET notify-keyspace-events AKE
+```
+
+### Side-by-Side Comparison
+
+| Aspect | Pub/Sub | Keyspace Notifications |
+|--------|---------|------------------------|
+| **Notification trigger** | Explicit `PUBLISH` | Automatic on write |
+| **Producer awareness** | Must call `PUBLISH` | No awareness needed |
+| **Message content** | Producer-defined (`"G"`) | Key name + operation |
+| **Channel naming** | Custom (`TABLE_CHANNEL@0`) | Fixed (`__keyspace@N__:key`) |
+| **Key name in message** | No (must track separately) | Yes (in channel name) |
+| **Operation type** | No | Yes (`hset`, `del`, etc.) |
+| **Used in SONiC** | APPL_DB | CONFIG_DB, STATE_DB |
+| **Consumer class** | `ConsumerStateTable` | `SubscriberStateTable` |
+
+### Why readData() Differs Between Classes
+
+| Class | readData() behavior | Why |
+|-------|---------------------|-----|
+| `ConsumerStateTable` | Discards notification | Content is just `"G"` - useless |
+| `SubscriberStateTable` | Saves notification | Contains key name - needed for `pops()` |
+
+---
+
+## Reliability Comparison
+
+### Overview
+
+| Scenario | ConsumerStateTable | SubscriberStateTable |
+|----------|-------------------|---------------------|
+| SET then quick DEL | Safe - reads from staging hash | **Data lost** - real table already deleted |
+| Multiple rapid updates | Gets latest value | May process stale intermediate states |
+| Consumer slow/blocked | Data persists in staging | **Notifications lost** (buffer overflow) |
+| Consumer restart | KEY_SET persists, can recover | **Missed notifications** during downtime |
+| Producer crash mid-write | Atomic Lua script | Partial state possible |
+
+### SubscriberStateTable Failure Scenarios
+
+#### 1. SET Followed by Quick DEL (Data Loss)
+
+```
+Time 0ms: Writer: HSET PORT|Eth0 speed 100000
+          → Redis generates: __keyspace notification (hset)
+
+Time 1ms: Writer: DEL PORT|Eth0
+          → Redis generates: __keyspace notification (del)
+
+Time 5ms: Consumer: readData()
+          → Receives both notifications, buffers them
+
+Time 6ms: Consumer: pops() processes "hset" notification
+          → HGETALL PORT|Eth0
+          → Returns EMPTY! (already deleted)
+          → Consumer thinks it's a DEL, not SET ❌
+```
+
+**Result:** Lost the SET operation entirely.
+
+#### 2. Notification Buffer Overflow
+
+```
+Redis keyspace notification buffer is LIMITED (client-output-buffer-limit)
+
+If consumer is slow:
+  Notification 1: buffered
+  Notification 2: buffered
+  ...
+  Notification 1000: buffered
+  Notification 1001: DROPPED! ❌
+
+Consumer never knows about dropped notifications.
+```
+
+#### 3. Consumer Restart (Missed Updates)
+
+```
+Time 0: Consumer running, subscribed to __keyspace@4__:*
+Time 1: Writer: HSET PORT|Eth0 speed 100000 → notification sent
+Time 2: Consumer crashes/restarts
+Time 3: Writer: HSET PORT|Eth4 mtu 9100 → notification sent (consumer not listening)
+Time 4: Consumer starts, re-subscribes
+Time 5: Writer: HSET PORT|Eth8 admin up
+
+Result: Consumer missed Eth0 and Eth4 changes ❌
+```
+
+#### 4. Rapid Updates (Inefficient Processing)
+
+```
+Time 0ms: Writer: HSET PORT|Eth0 speed 10000
+          → Notification queued
+Time 1ms: Writer: HSET PORT|Eth0 speed 25000
+          → Notification queued
+Time 2ms: Writer: HSET PORT|Eth0 speed 100000
+          → Notification queued
+
+Time 5ms: Consumer processes notification 1
+          → HGETALL PORT|Eth0 → gets 100000 (latest, OK)
+Time 6ms: Consumer processes notification 2
+          → HGETALL PORT|Eth0 → gets 100000 (same, wasted work)
+Time 7ms: Consumer processes notification 3
+          → HGETALL PORT|Eth0 → gets 100000 (same, wasted work)
+```
+
+**Result:** 3 SAI calls for same final state (inefficient).
+
+### ConsumerStateTable Advantages
+
+#### 1. SET Followed by DEL (Safe)
+
+```
+Time 0ms: Producer: HSET _PORT_TABLE:Eth0 speed 100000
+                    SADD PORT_TABLE_KEY_SET Eth0
+
+Time 1ms: Producer: SADD PORT_TABLE_DEL_SET Eth0  (marks for deletion)
+                    SADD PORT_TABLE_KEY_SET Eth0  (already in set, no-op)
+
+Time 5ms: Consumer: pops() via Lua script
+          → SPOP KEY_SET → {Eth0}
+          → SREM DEL_SET Eth0 → returns 1 (was marked for del)
+          → DEL PORT_TABLE:Eth0 (delete real table)
+          → HGETALL _PORT_TABLE:Eth0 → returns {} (empty)
+          → Correctly interprets as DEL operation ✅
+```
+
+#### 2. Consumer Restart (Recoverable)
+
+```
+Time 0: Producer writes Eth0 → KEY_SET = {Eth0}
+Time 1: Producer writes Eth4 → KEY_SET = {Eth0, Eth4}
+Time 2: Consumer crashes
+Time 3: Producer writes Eth8 → KEY_SET = {Eth0, Eth4, Eth8}
+Time 4: Consumer restarts
+Time 5: Consumer pops() → Gets ALL pending keys ✅
+
+KEY_SET and staging hashes PERSIST in Redis.
+```
+
+#### 3. Rapid Updates (Efficient)
+
+```
+Time 0ms: Producer: HSET _PORT_TABLE:Eth0 speed 10000
+                    SADD KEY_SET Eth0
+Time 1ms: Producer: HSET _PORT_TABLE:Eth0 speed 25000
+                    SADD KEY_SET Eth0  (already in set)
+Time 2ms: Producer: HSET _PORT_TABLE:Eth0 speed 100000
+                    SADD KEY_SET Eth0  (already in set)
+
+Time 5ms: Consumer: pops()
+          → SPOP KEY_SET → {Eth0}  (only ONE entry)
+          → HGETALL _PORT_TABLE:Eth0 → gets 100000 (latest)
+          → ONE SAI call with final state ✅
+```
+
+### Full Pros/Cons Comparison
+
+| Aspect | ConsumerStateTable | SubscriberStateTable |
+|--------|-------------------|---------------------|
+| **Reliability** | High | Lower |
+| **Data persistence** | Staging + KEY_SET persist | Notifications are transient |
+| **Crash recovery** | Full recovery | Missed during downtime |
+| **SET→DEL race** | Handled correctly | Data loss |
+| **Atomicity** | Lua script | None |
+| **Rapid updates** | Coalesced (efficient) | Each processed separately |
+| **Buffer overflow** | KEY_SET unlimited | Notification buffer limited |
+| **Producer coupling** | Must use ProducerStateTable | Any client works |
+| **Setup complexity** | More complex | Simple |
+| **Storage overhead** | Staging hash + sets | None |
+| **Latency** | Lua script overhead | Direct read |
+
+### Why SONiC Uses Each
+
+#### APPL_DB → ConsumerStateTable
+
+```
+High-volume, critical path:
+- Route updates (millions of routes)
+- Port configuration
+- Neighbor entries
+
+Requirements:
+- Cannot lose any update
+- Must handle producer faster than consumer
+- Must survive restarts
+- Atomicity needed
+```
+
+#### CONFIG_DB / STATE_DB → SubscriberStateTable
+
+```
+Lower-volume, less critical:
+- Configuration changes (human-initiated)
+- State monitoring
+
+Acceptable trade-offs:
+- Config changes are rare
+- Operator can re-apply if missed
+- Simplicity over reliability
+- Any tool can write (CLI, REST API)
 ```
 
 ---
