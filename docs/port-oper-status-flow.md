@@ -27,7 +27,7 @@ There are two distinct paths that lead to a port's operational status going down
 | Trigger | Origin | Flow Path |
 |---------|--------|-----------|
 | Link Failure | Hardware/PHY layer detects loss of signal | SAI SDK -> syncd -> ASIC_DB NOTIFICATIONS -> orchagent |
-| Admin Shutdown | User configuration (CONFIG_DB) | CONFIG_DB -> portsorch -> SAI API -> SAI generates notification -> orchagent |
+| Admin Shutdown | User configuration (CONFIG_DB) | CONFIG_DB -> portmgrd -> APPL_DB -> portsorch -> SAI API -> SAI notification (via syncd/ASIC_DB in Redis async) -> portsorch |
 
 Both paths ultimately converge at the `updatePortOperStatus()` function in portsorch.cpp, which handles all downstream updates.
 
@@ -267,7 +267,7 @@ User Command: config interface shutdown Ethernet0
          |
          v (SubscriberStateTable in portmgrd)
 +-------------------+
-| PortMgr::doTask() |  cfgmgr/portmgr.cpp:138
+| PortMgr::doTask() |  cfgmgr/portmgr.cpp:138 (CONFIG_DB consumer)
 +-------------------+
          |
          v
@@ -284,7 +284,7 @@ User Command: config interface shutdown Ethernet0
 | <port> down       |       | (APPL_DB)         |
 +-------------------+       +-------------------+
          |                           |
-         v                           v (SubscriberStateTable in orchagent)
+         v                           v (ConsumerStateTable in orchagent)
 +-------------------+       +-------------------+
 | Kernel netdev     |       | PortsOrch::       |  portsorch.cpp:5156-5170
 | IFF_UP = 0        |       | doPortTask()      |
@@ -301,7 +301,7 @@ User Command: config interface shutdown Ethernet0
 | STATE_DB update #1  |     | sai_port_api->    |  portsorch.cpp:2125
 | admin_status=down   |     | set_port_attribute|  (SAI_PORT_ATTR_ADMIN_STATE)
 | netdev_oper_status  |     +-------------------+
-| =up (unchanged)     |              |
+| =(unchanged/driver) |              |
 +---------------------+              v (SAI/SDK brings port down)
                             +-------------------+
                             | SAI SDK           |  Hardware executes admin down
@@ -418,6 +418,8 @@ When a user shuts down an interface, two parallel paths are triggered:
    - SAI/SDK brings ASIC port down → Generates oper status notification
    - portsorch receives notification → Updates APPL_DB (`oper_status`)
 
+> **Note:** portmgrd may write `admin_status` to APPL_DB either immediately (if the netdev is not ready) or after the `ip link set` succeeds. The diagram shows the common "port ready" case.
+
 ### Admin Status vs Oper Status
 
 - **Admin Status**: User-configurable. Can be set to UP/DOWN via CONFIG_DB.
@@ -445,47 +447,51 @@ void PortsOrch::updatePortOperStatus(Port &port, sai_port_oper_status_t status)
 
     // 3. Update APPL_DB with oper_status
     if (port.m_type == Port::PHY || port.m_type == Port::TUNNEL) {
-        updateDbPortOperStatus(port, status);  // writes to APPL_DB PORT_TABLE
+        updateDbPortOperStatus(port, status);  // APPL_DB PORT_TABLE
     }
 
-    // 4. Update flap count and timestamps (APPL_DB)
+    // 4. Update flap count, gearbox, and pollers for PHY
     if (port.m_type == Port::PHY) {
-        updateDbPortFlapCount(port, status);   // writes to APPL_DB PORT_TABLE
+        updateDbPortFlapCount(port, status);   // APPL_DB PORT_TABLE
         updateGearboxPortOperStatus(port);
 
-        // Refresh auto-negotiation state
+        // Refresh state and reschedule pollers as needed
         if (port.m_autoneg > 0) {
             refreshPortStateAutoNeg(port);
+            updatePortStatePoll(port, PORT_STATE_POLL_AN, !(status == SAI_PORT_OPER_STATUS_UP));
         }
-        // Refresh link training state
         if (port.m_link_training > 0) {
             refreshPortStateLinkTraining(port);
+            updatePortStatePoll(port, PORT_STATE_POLL_LT, !(status == SAI_PORT_OPER_STATUS_UP));
         }
     }
 
     // 5. Update internal state
     port.m_oper_status = status;
 
-    // 6. Update host interface (kernel netdev) - this triggers portsyncd to update STATE_DB
+    // 6. TUNNEL ports stop here (no hostif/next-hop/VOQ/observer updates)
+    if (port.m_type == Port::TUNNEL) {
+        return;
+    }
+
     bool isUp = status == SAI_PORT_OPER_STATUS_UP;
+    // 7. Update host interface oper status (PHY only)
     if (port.m_type == Port::PHY) {
         setHostIntfsOperStatus(port, isUp);  // portsorch.cpp:3649
     }
 
-    // 7. Inform NeighOrch about next hop changes
+    // 8. Inform NeighOrch about next-hop changes (parent + children)
     gNeighOrch->ifChangeInformNextHop(port.m_alias, isUp);
-
-    // Also for child ports (sub-interfaces)
     for (const auto &child_port : port.m_child_ports) {
         gNeighOrch->ifChangeInformNextHop(child_port, isUp);
     }
 
-    // 8. VOQ chassis: sync interface state
-    if (gMySwitchType == "voq") {
+    // 9. VOQ chassis: sync interface state (when chassis DB is enabled)
+    if (isChassisDbInUse() && gIntfsOrch->isLocalSystemPortIntf(port.m_alias)) {
         gIntfsOrch->voqSyncIntfState(port.m_alias, isUp);
     }
 
-    // 9. Notify observers (FdbOrch, FgNhgOrch, etc.)
+    // 10. Notify observers (FdbOrch, FgNhgOrch, etc.)
     PortOperStateUpdate update = {port, status};
     notify(SUBJECT_TYPE_PORT_OPER_STATE_CHANGE, static_cast<void *>(&update));
 }
@@ -495,7 +501,7 @@ void PortsOrch::updatePortOperStatus(Port &port, sai_port_oper_status_t status)
 
 ## Downstream Components Affected
 
-When a port goes operationally down, the following components are notified/updated:
+When a port goes operationally down, the following components are notified/updated (PHY ports; TUNNEL ports return earlier after the APPL_DB update):
 
 ### 1. Database Updates
 
@@ -576,6 +582,11 @@ void FdbOrch::updatePortOperState(const PortOperStateUpdate& update)
         vlan_members_t vlan_members;
         m_portsOrch->getPortVlanMembers(p, vlan_members);
         for (const auto& vlan_member: vlan_members) {
+            swss::Port vlan;
+            string vlan_alias = VLAN_PREFIX + to_string(vlan_member.first);
+            if (!m_portsOrch->getPort(vlan_alias, vlan)) {
+                continue;
+            }
             notifyObserversFDBFlush(p, vlan.m_vlan_info.vlan_oid);
         }
     }
@@ -599,10 +610,10 @@ case SUBJECT_TYPE_PORT_OPER_STATE_CHANGE:
 ```
 
 ### 6. VOQ System (Modular Chassis)
-For VOQ-based distributed systems (`portsorch.cpp:9103-9109`):
+For VOQ-based distributed systems when chassis DB is enabled (`portsorch.cpp:9103-9109`):
 
 ```cpp
-if (gMySwitchType == "voq")
+if (isChassisDbInUse())
 {
     if (gIntfsOrch->isLocalSystemPortIntf(port.m_alias))
     {
@@ -706,7 +717,7 @@ T11|      |          |          |    STATE_DB update #2  |           |          
 |------|-----------|--------|---------|
 | T1 | portmgrd | `ip link set dev <port> down` | CONFIG_DB change |
 | T2 | Kernel | Clears IFF_UP, sends RTM_NEWLINK #1 | ip link command |
-| T3 | portsyncd | STATE_DB: admin_status=down, netdev_oper_status=up | Netlink #1 |
+| T3 | portsyncd | STATE_DB: admin_status=down, netdev_oper_status=(unchanged/driver-dependent) | Netlink #1 |
 | T4 | portsorch | Receives APPL_DB change | portmgrd writeConfigToAppDb |
 | T5 | portsorch | Calls SAI setPortAdminStatus | APPL_DB change |
 | T6 | SAI/SDK | Brings ASIC port down | SAI API call |
@@ -720,7 +731,7 @@ T11|      |          |          |    STATE_DB update #2  |           |          
 
 1. **Two Netlink Events**: RTM_NEWLINK #1 (from portmgrd) and RTM_NEWLINK #2 (from portsorch)
 2. **Two STATE_DB Updates**: portsyncd updates STATE_DB twice - once per netlink event
-3. **Both fields updated together**: Each netlink event contains both IFF_UP and IFF_RUNNING flags
+3. **Both fields updated together**: Each netlink event contains both IFF_UP and IFF_RUNNING flags (values depend on driver/SAI timing)
 4. **Trigger chain**: `setHostIntfsOperStatus()` → SAI hostif API → Kernel IFF_RUNNING change → Netlink → portsyncd → STATE_DB
 
 ---
@@ -756,7 +767,7 @@ T11|      |          |          |    STATE_DB update #2  |           |          
    - **User-initiated (admin shutdown):** CONFIG_DB → portmgrd → kernel + APPL_DB → portsorch → SAI → notification
 
 2. **User-initiated shutdown involves parallel paths:**
-   - **portmgrd**: `ip link set dev <port> down` → kernel netdev down → portsyncd → STATE_DB
+   - **portmgrd**: Writes admin_status to APPL_DB and drives kernel admin state (`ip link set`) → portsyncd → STATE_DB
    - **portsorch**: APPL_DB change → SAI API → ASIC port down → SAI notification → APPL_DB
 
 3. **Central orchestration:** Both hardware and user-initiated paths converge at `updatePortOperStatus()` which handles all downstream updates
