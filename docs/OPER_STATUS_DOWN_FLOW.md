@@ -1,5 +1,7 @@
 # SONiC SWSS Operational Status Down Flow
 
+> **Based on:** sonic-net/sonic-swss commit [`3ccfa62`](https://github.com/sonic-net/sonic-swss/tree/3ccfa6299c8722e528cd5eba50805f753c2b3177). Line numbers and code references may differ in other versions.
+
 This document explains the operational status (oper status) down flow in SONiC SWSS, covering both hardware-initiated (link failure) and user-initiated (admin shutdown) scenarios.
 
 > **Note:** This document describes the **default Redis async communication mode** (`SAI_REDIS_COMMUNICATION_MODE_REDIS_ASYNC`), which is used by most production deployments. Some platforms (e.g., Nvidia/Mellanox) use ZMQ mode (`SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC`) which has a slightly different notification path. See [Communication Modes](#communication-modes) for details.
@@ -686,8 +688,8 @@ T8|       |          |          |            |           |           |          
 T9|       |          |          |            |           |           |--setHostIntfsOperStatus
   |       |          |          |            |           |           |  SAI_HOSTIF_ATTR_     |
   |       |          |          |            |           |           |  OPER_STATUS=false    |
-  |       |          |<--------------------------------------------|           |           |
-  |       |          |IFF_RUNNING=0          |           |           |           |           |
+  |       |          |          |<-------------------------------------------|           |
+  |       |          |  IFF_RUNNING=0        |           |           |           |           |
   |       |          |          |            |           |           |           |           |
 T10|      |          |  RTM_NEWLINK #2       |           |           |           |           |
   |       |          |          |----------->|           |           |           |           |
