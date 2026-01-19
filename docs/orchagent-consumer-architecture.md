@@ -1,20 +1,17 @@
 # Orchagent Consumer Architecture
 
-This document explains how orchagent consumes data from Redis databases using ConsumerStateTable and SubscriberStateTable, and how the main event loop processes these events.
+This document explains how orchagent consumes data from Redis databases using different consumer mechanisms, and how the main event loop processes these events.
 
 ## Table of Contents
 
 1. [Overview](#overview)
 2. [Threading Model](#threading-model)
 3. [Select Loop Architecture](#select-loop-architecture)
-4. [ConsumerStateTable vs SubscriberStateTable](#consumerstatetable-vs-subscriberstatetable)
-5. [ConsumerStateTable Deep Dive](#consumerstatetable-deep-dive)
-6. [SubscriberStateTable Deep Dive](#subscriberstatetable-deep-dive)
-7. [Redis Notification Mechanisms](#redis-notification-mechanisms)
-8. [Reliability Comparison](#reliability-comparison)
-9. [Redis Data Structures](#redis-data-structures)
-10. [Producer-Consumer Model](#producer-consumer-model)
-11. [Code References](#code-references)
+4. [Redis Notification Mechanisms](#redis-notification-mechanisms)
+5. [Consumer Classes](#consumer-classes)
+6. [Reliability Comparison](#reliability-comparison)
+7. [Producer-Consumer Model](#producer-consumer-model)
+8. [Code References](#code-references)
 
 ---
 
@@ -30,6 +27,7 @@ Orchagent is the core component in SONiC that translates high-level configuratio
 | `Selectable` | Base interface for event sources |
 | `ConsumerStateTable` | Consumes from APPL_DB (producer-consumer queue pattern) |
 | `SubscriberStateTable` | Consumes from CONFIG_DB/STATE_DB (keyspace notifications) |
+| `NotificationConsumer` | Consumes async events from syncd (JSON in pub/sub) |
 | `Consumer` | Wrapper that connects a table to an Orch |
 | `Orch` | Base class for all orchestrators (PortsOrch, RouteOrch, etc.) |
 
@@ -144,200 +142,6 @@ int Select::poll_descriptors(Selectable **c, unsigned int timeout, ...)
 
 ---
 
-## ConsumerStateTable vs SubscriberStateTable
-
-| Aspect | ConsumerStateTable | SubscriberStateTable |
-|--------|-------------------|---------------------|
-| **Used for** | APPL_DB | CONFIG_DB, STATE_DB |
-| **Subscription** | Custom channel: `TABLE_CHANNEL@0` | Redis keyspace: `__keyspace@N__:TABLE:*` |
-| **Notification content** | Just `"G"` (meaningless signal) | Contains key name + operation |
-| **Data staging** | Temporary hash `_TABLE:key` | Direct table `TABLE\|key` |
-| **Atomicity** | Lua script for atomic pop | No atomicity guarantees |
-| **Producer** | Must use `ProducerStateTable` | Any Redis client (CLI, etc.) |
-
-### When Each Is Used
-
-**File:** `orchagent/orch.cpp:1090-1100`
-
-```cpp
-void Orch::addConsumer(DBConnector *db, string tableName, int pri)
-{
-    if (db->getDbId() == CONFIG_DB || db->getDbId() == STATE_DB) {
-        // Uses keyspace notifications
-        addExecutor(new Consumer(new SubscriberStateTable(...)));
-    } else {
-        // APPL_DB uses producer-consumer queue
-        addExecutor(new Consumer(new ConsumerStateTable(...)));
-    }
-}
-```
-
----
-
-## ConsumerStateTable Deep Dive
-
-### Two-Phase Data Retrieval
-
-ConsumerStateTable uses a two-phase approach:
-
-1. **`readData()`** - Read pub/sub notification (just counts, discards content)
-2. **`pops()`** - Fetch actual data via Lua script
-
-### Why Two Phases?
-
-| Phase | Method | Purpose |
-|-------|--------|---------|
-| 1 | `readData()` | **Notification** - "something changed" (lightweight) |
-| 2 | `pops()` | **Retrieval** - get actual data (heavier) |
-
-**Reasons for separation:**
-- `Select` class is generic - it handles any `Selectable`, only knows to call `readData()`
-- Batching - multiple notifications can arrive, `pops()` fetches all at once
-- Notification content is just `"G"` - no useful data to save
-- Fair scheduling - `m_queueLength` enables round-robin across tables
-
-### readData() Implementation
-
-**File:** `sonic-swss-common/common/redisselect.cpp:25-53`
-
-```cpp
-uint64_t RedisSelect::readData()
-{
-    redisReply *reply = nullptr;
-
-    // Read one notification from the Redis SUBSCRIBE socket
-    redisGetReply(m_subscribe->getContext(), reinterpret_cast<void**>(&reply));
-
-    freeReplyObject(reply);     // Discard - content is just "G"
-    m_queueLength++;            // Just count notifications
-
-    // Drain any additional buffered notifications
-    do {
-        status = redisGetReplyFromReader(..., &reply);
-        if (reply != nullptr && status == REDIS_OK) {
-            m_queueLength++;
-            freeReplyObject(reply);
-        }
-    } while (reply != nullptr && status == REDIS_OK);
-
-    return 0;
-}
-```
-
-### pops() Implementation
-
-**File:** `sonic-swss-common/common/consumerstatetable.cpp:36-94`
-
-```cpp
-void ConsumerStateTable::pops(deque<KeyOpFieldsValuesTuple> &vkco, ...)
-{
-    RedisCommand command;
-    command.format(
-        "EVALSHA %s 3 %s %s%s %s %d %s",
-        m_shaPop.c_str(),           // Lua script SHA
-        getKeySetName().c_str(),    // KEYS[1]: PORT_TABLE_KEY_SET
-        getTableName().c_str(),     // KEYS[2]: PORT_TABLE:
-        getTableNameSeparator().c_str(),
-        getDelKeySetName().c_str(), // KEYS[3]: PORT_TABLE_DEL_SET
-        POP_BATCH_SIZE,             // ARGV[1]: batch size
-        getStateHashPrefix().c_str()); // ARGV[2]: "_" prefix
-
-    RedisReply r(m_db, command);
-    // ... parse results
-}
-```
-
-### The Lua Script
-
-**File:** `sonic-swss-common/common/consumer_state_table_pops.lua`
-
-```lua
-local ret = {}
-local tablename = KEYS[2]                           -- "PORT_TABLE:"
-local stateprefix = ARGV[2]                         -- "_"
-
--- 1. Pop keys from the KEY_SET (atomically)
-local keys = redis.call('SPOP', KEYS[1], ARGV[1])   -- SPOP PORT_TABLE_KEY_SET <batch>
-
-for i = 1, n do
-   local key = keys[i]
-
-   -- 2. Check if key was marked for deletion
-   local num = redis.call('SREM', KEYS[3], key)     -- SREM PORT_TABLE_DEL_SET key
-   if num == 1 then
-      redis.call('DEL', tablename..key)             -- DEL PORT_TABLE:Ethernet0
-   end
-
-   -- 3. Get field-values from temporary STAGING hash
-   local fieldvalues = redis.call('HGETALL', stateprefix..tablename..key)
-   table.insert(ret, {key, fieldvalues})
-
-   -- 4. Copy to PERMANENT table
-   for i = 1, #fieldvalues, 2 do
-      redis.call('HSET', tablename..key, fieldvalues[i], fieldvalues[i + 1])
-   end
-
-   -- 5. Clean up staging hash
-   redis.call('DEL', stateprefix..tablename..key)
-end
-return ret
-```
-
-**Key insight:** The **consumer** writes to the actual DB table, not the producer. Producer only writes to the staging hash with `_` prefix.
-
----
-
-## SubscriberStateTable Deep Dive
-
-### Why It Has Its Own readData()
-
-SubscriberStateTable overrides `readData()` because the notification **contains the key name**:
-
-```
-Channel: "__keyspace@4__:PORT_TABLE|Ethernet0"
-Data:    "hset" or "del"
-```
-
-### readData() - Saves Notifications
-
-```cpp
-uint64_t SubscriberStateTable::readData() {
-    redisGetReply(..., &reply);
-    m_keyspace_event_buffer.emplace_back(reply);  // SAVES the notification!
-
-    // Drain more buffered notifications
-    do {
-        redisGetReplyFromReader(..., &reply);
-        if (reply != nullptr) {
-            m_keyspace_event_buffer.emplace_back(reply);  // SAVES each one
-        }
-    } while (reply != nullptr);
-}
-```
-
-### pops() - Parses Saved Notifications
-
-```cpp
-void SubscriberStateTable::pops(...) {
-    while (auto event = popEventBuffer()) {           // Uses saved notifications
-        auto message = event->getReply<RedisMessage>();
-
-        // Parse key from channel: "__keyspace@4__:PORT_TABLE|Ethernet0"
-        string key = parseKeyFromChannel(message.channel);
-
-        if (message.data == "del") {
-            kfvOp(kco) = DEL_COMMAND;
-        } else {
-            m_table.get(key, kfvFieldsValues(kco));   // Fetch from actual table
-            kfvOp(kco) = SET_COMMAND;
-        }
-        vkco.push_back(kco);
-    }
-}
-```
-
----
-
 ## Redis Notification Mechanisms
 
 All three consumer mechanisms in SONiC are fundamentally based on **Redis Pub/Sub**. Redis Keyspace Notifications are a specialized form of pub/sub where Redis defines the payload format.
@@ -358,32 +162,13 @@ ConsumerStateTable    NotificationConsumer    SubscriberStateTable
   + Staging hash
 ```
 
-**Key insight:** SubscriberStateTable's reliability limitations stem from Redis keyspace notifications only providing key + event type in the payload, not actual field values. If Redis keyspace notifications included the data values, SubscriberStateTable would be as reliable as NotificationConsumer.
+### 1. Pub/Sub with Signal (ConsumerStateTable)
 
-### Redis Pub/Sub with Signal (used by ConsumerStateTable)
-
-**Explicit messaging** - producer must explicitly publish.
-
-```
-Producer:                              Consumer:
-PUBLISH PORT_TABLE_CHANNEL@0 "G"  ──►  SUBSCRIBE PORT_TABLE_CHANNEL@0
-```
-
-#### Characteristics
-
-| Aspect | Description |
-|--------|-------------|
-| **Trigger** | Explicit `PUBLISH` command by producer |
-| **Content** | Producer controls message content (SONiC uses `"G"`) |
-| **Channel** | Custom channel name: `TABLE_CHANNEL@N` |
-| **Coupling** | Producer must know to publish |
-| **Used by** | `ProducerStateTable` → `ConsumerStateTable` |
-
-#### Example
+**Explicit messaging** - producer publishes a simple signal.
 
 ```bash
 # Producer
-redis-cli PUBLISH PORT_TABLE_CHANNEL@0 "G"
+PUBLISH PORT_TABLE_CHANNEL@0 "G"
 
 # Consumer receives:
 1) "message"
@@ -391,86 +176,240 @@ redis-cli PUBLISH PORT_TABLE_CHANNEL@0 "G"
 3) "G"                        # Just a signal, no useful data
 ```
 
-### Redis Keyspace Notifications (used by SubscriberStateTable)
+Data is stored separately in staging hash + KEY_SET, fetched by Lua script during `pops()`.
 
-**Automatic notifications** - Redis automatically notifies when keys change.
-
-```
-Any client:                            Consumer:
-HSET PORT|Eth0 speed 100000  ──►  Redis auto-generates notification
-                                       │
-                                       ▼
-                              PSUBSCRIBE __keyspace@4__:PORT|*
-```
-
-#### Characteristics
-
-| Aspect | Description |
-|--------|-------------|
-| **Trigger** | Automatic on any key modification |
-| **Content** | Contains key name and operation type |
-| **Channel** | Auto-generated: `__keyspace@N__:TABLE\|key` |
-| **Coupling** | No producer awareness needed |
-| **Used by** | Any writer → `SubscriberStateTable` |
-
-#### Example
-
-```bash
-# Any client writes to Redis
-redis-cli HSET "PORT|Ethernet0" speed 100000
-
-# Consumer receives (automatic):
-1) "pmessage"
-2) "__keyspace@4__:PORT|*"              # Pattern subscribed
-3) "__keyspace@4__:PORT|Ethernet0"      # Actual key that changed
-4) "hset"                               # Operation type
-```
-
-#### Must Be Enabled in Redis
-
-```bash
-# Enable keyspace notifications (CONFIG_DB uses this)
-redis-cli CONFIG SET notify-keyspace-events AKE
-```
-
-### Redis Pub/Sub with JSON Payload (used by NotificationConsumer)
+### 2. Pub/Sub with JSON Payload (NotificationConsumer)
 
 **Self-contained messages** - full data embedded in JSON payload.
 
-```
-Producer (syncd):                              Consumer (orchagent):
-PUBLISH NOTIFICATIONS '{"op":"port_state",     SUBSCRIBE NOTIFICATIONS
-  "data":"oid:0x1000", "state":"up"}'    ──►   receives full JSON data
-```
-
-#### Characteristics
-
-| Aspect | Description |
-|--------|-------------|
-| **Trigger** | Explicit `PUBLISH` command by producer |
-| **Content** | Full JSON payload with all event data |
-| **Channel** | Custom channel name (e.g., `NOTIFICATIONS`) |
-| **Coupling** | Producer must use `NotificationProducer` |
-| **Used by** | `syncd` → `orchagent` for SAI events |
-
-#### Example
-
 ```bash
 # Producer (syncd)
-redis-cli PUBLISH NOTIFICATIONS '[["port_state_change","oid:0x1000"],["state","up"]]'
+PUBLISH NOTIFICATIONS '[["port_state_change","oid:0x1000"],["state","up"]]'
 
 # Consumer receives:
 1) "message"
 2) "NOTIFICATIONS"
-3) '[["port_state_change","oid:0x1000"],["state","up"]]'   # Full data in message!
+3) '[["port_state_change","oid:0x1000"],["state","up"]]'   # Full data!
 ```
 
-#### Use Cases in Orchagent
+### 3. Keyspace Notifications (SubscriberStateTable)
+
+**Automatic notifications** - Redis automatically notifies when keys change.
+
+```bash
+# Any client writes to Redis
+HSET "PORT|Ethernet0" speed 100000
+
+# Consumer receives (automatic):
+1) "pmessage"
+2) "__keyspace@4__:PORT|*"
+3) "__keyspace@4__:PORT|Ethernet0"      # Key that changed
+4) "hset"                               # Operation type (NO VALUES!)
+```
+
+Must be enabled: `redis-cli CONFIG SET notify-keyspace-events AKE`
+
+### Why Redis Keyspace Notifications Don't Include Values
+
+Redis designed keyspace notifications as lightweight signals, not data carriers. This is a deliberate design choice:
+
+#### 1. Performance / Efficiency
+
+```
+Scenario: HSET with 100 fields, 1000 subscribers
+
+With values:    100 fields × 1000 subscribers = 100,000 field copies
+Without values: 1 event × 1000 subscribers = 1,000 tiny messages
+```
+
+#### 2. Pub/Sub Buffer Pressure
+
+```
+Redis pub/sub has client-output-buffer-limit:
+  client-output-buffer-limit pubsub 32mb 8mb 60
+
+With values: Buffer fills quickly → MORE dropped notifications
+Without values: Tiny messages → Buffer lasts longer
+```
+
+Ironically, adding values could make reliability **worse**.
+
+#### 3. Not All Consumers Need Values
+
+```
+Consumer A: "I just need to know something changed" (cache invalidation)
+Consumer B: "I need the actual data" (sync)
+
+Current design lets Consumer A stay lightweight.
+```
+
+#### 4. Data Type Complexity
+
+```
+STRING:  Simple value
+HASH:    Which fields changed? All fields? Just modified ones?
+LIST:    Which elements? Head? Tail? Index?
+SET:     Which members added/removed?
+```
+
+No universal "value" representation works for all types.
+
+#### 5. Design Philosophy
+
+Redis keyspace notifications = **"WHAT changed"** (event signal)
+Not designed for = **"WHAT + VALUE"** (change data capture)
+
+For full change data capture, Redis offers Redis Streams or replication.
+
+#### Impact on SONiC
+
+This Redis limitation is why `SubscriberStateTable` has reliability issues - it must fetch data separately, creating race conditions. SONiC works around this with `ConsumerStateTable` (staging + KEY_SET) for critical paths.
+
+### Comparison Table
+
+| Aspect | ConsumerStateTable | NotificationConsumer | SubscriberStateTable |
+|--------|-------------------|---------------------|---------------------|
+| **Subscription** | Custom channel | Custom channel | Keyspace pattern |
+| **Trigger** | Explicit `PUBLISH` | Explicit `PUBLISH` | Automatic on write |
+| **Message content** | `"G"` (signal) | Full JSON data | Key + event type |
+| **Data source** | Staging hash | Message itself | Must fetch from table |
+| **Producer coupling** | ProducerStateTable | NotificationProducer | Any client |
+
+---
+
+## Consumer Classes
+
+### ConsumerStateTable
+
+Used for **APPL_DB** - high-reliability table synchronization.
+
+#### Two-Phase Data Retrieval
+
+1. **`readData()`** - Read pub/sub notification (counts, discards content)
+2. **`pops()`** - Fetch actual data via atomic Lua script
+
+#### readData() Implementation
+
+**File:** `sonic-swss-common/common/redisselect.cpp:25-53`
+
+```cpp
+uint64_t RedisSelect::readData()
+{
+    redisReply *reply = nullptr;
+    redisGetReply(m_subscribe->getContext(), reinterpret_cast<void**>(&reply));
+
+    freeReplyObject(reply);     // Discard - content is just "G"
+    m_queueLength++;            // Just count notifications
+
+    // Drain any additional buffered notifications
+    do {
+        status = redisGetReplyFromReader(..., &reply);
+        if (reply != nullptr && status == REDIS_OK) {
+            m_queueLength++;
+            freeReplyObject(reply);
+        }
+    } while (reply != nullptr && status == REDIS_OK);
+    return 0;
+}
+```
+
+#### pops() Lua Script
+
+**File:** `sonic-swss-common/common/consumer_state_table_pops.lua`
+
+```lua
+local ret = {}
+local tablename = KEYS[2]                           -- "PORT_TABLE:"
+local stateprefix = ARGV[2]                         -- "_"
+
+-- 1. Pop keys from the KEY_SET (atomically)
+local keys = redis.call('SPOP', KEYS[1], ARGV[1])
+
+for i = 1, n do
+   local key = keys[i]
+
+   -- 2. Check if key was marked for deletion
+   local num = redis.call('SREM', KEYS[3], key)
+   if num == 1 then
+      redis.call('DEL', tablename..key)
+   end
+
+   -- 3. Get field-values from STAGING hash
+   local fieldvalues = redis.call('HGETALL', stateprefix..tablename..key)
+   table.insert(ret, {key, fieldvalues})
+
+   -- 4. Copy to PERMANENT table
+   for i = 1, #fieldvalues, 2 do
+      redis.call('HSET', tablename..key, fieldvalues[i], fieldvalues[i + 1])
+   end
+
+   -- 5. Clean up staging hash
+   redis.call('DEL', stateprefix..tablename..key)
+end
+return ret
+```
+
+**Key insight:** The **consumer** writes to the actual DB table, not the producer.
+
+#### Redis Data Structures
+
+| Redis Key | Type | Written By | Read By | Purpose |
+|-----------|------|------------|---------|---------|
+| `_PORT_TABLE:Ethernet0` | HASH | Producer | Consumer | Staging area |
+| `PORT_TABLE:Ethernet0` | HASH | Consumer | Anyone | Real table |
+| `PORT_TABLE_KEY_SET` | SET | Producer | Consumer | Pending keys |
+| `PORT_TABLE_DEL_SET` | SET | Producer | Consumer | Keys to delete |
+| `PORT_TABLE_CHANNEL@0` | PUBSUB | Producer | Consumer | Notification |
+
+---
+
+### SubscriberStateTable
+
+Used for **CONFIG_DB / STATE_DB** - simpler but less reliable.
+
+#### Why It Overrides readData()
+
+The notification **contains the key name**, so it must be saved:
+
+```cpp
+uint64_t SubscriberStateTable::readData() {
+    redisGetReply(..., &reply);
+    m_keyspace_event_buffer.emplace_back(reply);  // SAVES the notification!
+    // ... drain more
+}
+```
+
+#### pops() - Must Fetch Data Separately
+
+```cpp
+void SubscriberStateTable::pops(...) {
+    while (auto event = popEventBuffer()) {
+        string key = parseKeyFromChannel(message.channel);
+
+        if (message.data == "del") {
+            kfvOp(kco) = DEL_COMMAND;
+        } else {
+            m_table.get(key, kfvFieldsValues(kco));  // FETCH from table!
+            kfvOp(kco) = SET_COMMAND;
+        }
+    }
+}
+```
+
+**Problem:** By the time `pops()` runs, the table data may have changed.
+
+---
+
+### NotificationConsumer
+
+Used for **SAI async events** from syncd - self-contained messages.
+
+#### Use Cases
 
 | Orch | Channel | Purpose |
 |------|---------|---------|
-| `PortsOrch` | NOTIFICATIONS | Port oper status changes from SAI |
-| `FdbOrch` | NOTIFICATIONS | FDB learn/age events from hardware |
+| `PortsOrch` | NOTIFICATIONS | Port oper status from SAI |
+| `FdbOrch` | NOTIFICATIONS | FDB learn/age events |
 | `BfdOrch` | NOTIFICATIONS | BFD session state changes |
 | `PfcWdOrch` | NOTIFICATIONS | PFC watchdog events |
 | `MACsecOrch` | NOTIFICATIONS | MACsec completion events |
@@ -478,7 +417,7 @@ redis-cli PUBLISH NOTIFICATIONS '[["port_state_change","oid:0x1000"],["state","u
 
 #### Why NotificationConsumer for SAI Events?
 
-SAI events are **asynchronous hardware events** - the data exists only at the moment of the callback. The event data must be captured immediately.
+SAI events are **asynchronous hardware events** - the data exists only at the moment of the callback:
 
 ```
 Hardware event (link up)
@@ -486,36 +425,14 @@ Hardware event (link up)
         ▼
     SAI callback in syncd
         │
-        ├─► Serialize event to JSON (captures state NOW)
-        └─► PUBLISH to NOTIFICATIONS channel
+        ├─► Serialize to JSON (captures state NOW)
+        └─► PUBLISH to NOTIFICATIONS
                 │
                 ▼
         orchagent (NotificationConsumer)
                 │
-                └─► Data is IN the message (safe from race conditions)
+                └─► Data is IN the message (safe)
 ```
-
-If SubscriberStateTable were used, by the time orchagent reads the table, the port state might have changed again.
-
-### Side-by-Side Comparison
-
-| Aspect | ConsumerStateTable | NotificationConsumer | SubscriberStateTable |
-|--------|-------------------|---------------------|---------------------|
-| **Subscription type** | Custom channel | Custom channel | Keyspace pattern |
-| **Notification trigger** | Explicit `PUBLISH` | Explicit `PUBLISH` | Automatic on write |
-| **Message content** | `"G"` (signal only) | Full JSON data | Key + event type |
-| **Data source** | Staging hash + KEY_SET | Message itself | Must fetch from table |
-| **SET→DEL race** | ✅ Safe | ✅ Safe | ❌ Data loss |
-| **Producer coupling** | Must use ProducerStateTable | Must use NotificationProducer | Any client works |
-| **Use case** | Table sync (APPL_DB) | Async events (SAI) | Table monitoring (CONFIG_DB) |
-
-### Why readData() Differs Between Classes
-
-| Class | readData() behavior | Why |
-|-------|---------------------|-----|
-| `ConsumerStateTable` | Discards notification | Content is just `"G"` - useless |
-| `NotificationConsumer` | Saves and parses JSON | Full data is in message |
-| `SubscriberStateTable` | Saves notification | Contains key name - needed for `pops()` |
 
 ---
 
@@ -531,125 +448,43 @@ If SubscriberStateTable were used, by the time orchagent reads the table, the po
 | Consumer restart | ✅ KEY_SET persists | ❌ **Missed** | ❌ **Missed** |
 | Producer crash mid-write | ✅ Atomic Lua | ✅ Atomic publish | ⚠️ Partial state |
 
-### SubscriberStateTable Failure Scenarios
+### Failure Scenarios
 
-#### 1. SET Followed by Quick DEL (Data Loss)
+#### SET Followed by Quick DEL
 
+**SubscriberStateTable (fails):**
 ```
-Time 0ms: Writer: HSET PORT|Eth0 speed 100000
-          → Redis generates: __keyspace notification (hset)
-
-Time 1ms: Writer: DEL PORT|Eth0
-          → Redis generates: __keyspace notification (del)
-
-Time 5ms: Consumer: readData()
-          → Receives both notifications, buffers them
-
-Time 6ms: Consumer: pops() processes "hset" notification
-          → HGETALL PORT|Eth0
-          → Returns EMPTY! (already deleted)
-          → Consumer thinks it's a DEL, not SET ❌
+Time 0ms: HSET PORT|Eth0 speed 100000 → notification "hset"
+Time 1ms: DEL PORT|Eth0 → notification "del"
+Time 5ms: Consumer pops "hset" → HGETALL PORT|Eth0 → EMPTY! ❌
 ```
 
-**Result:** Lost the SET operation entirely.
-
-#### 2. Notification Buffer Overflow
-
+**ConsumerStateTable (safe):**
 ```
-Redis keyspace notification buffer is LIMITED (client-output-buffer-limit)
-
-If consumer is slow:
-  Notification 1: buffered
-  Notification 2: buffered
-  ...
-  Notification 1000: buffered
-  Notification 1001: DROPPED! ❌
-
-Consumer never knows about dropped notifications.
+Time 0ms: HSET _PORT_TABLE:Eth0, SADD KEY_SET
+Time 1ms: SADD DEL_SET Eth0
+Time 5ms: Lua script checks DEL_SET → correctly handles as DEL ✅
 ```
 
-#### 3. Consumer Restart (Missed Updates)
+#### Consumer Restart
 
+**SubscriberStateTable (misses data):**
 ```
-Time 0: Consumer running, subscribed to __keyspace@4__:*
-Time 1: Writer: HSET PORT|Eth0 speed 100000 → notification sent
-Time 2: Consumer crashes/restarts
-Time 3: Writer: HSET PORT|Eth4 mtu 9100 → notification sent (consumer not listening)
-Time 4: Consumer starts, re-subscribes
-Time 5: Writer: HSET PORT|Eth8 admin up
-
-Result: Consumer missed Eth0 and Eth4 changes ❌
-```
-
-#### 4. Rapid Updates (Inefficient Processing)
-
-```
-Time 0ms: Writer: HSET PORT|Eth0 speed 10000
-          → Notification queued
-Time 1ms: Writer: HSET PORT|Eth0 speed 25000
-          → Notification queued
-Time 2ms: Writer: HSET PORT|Eth0 speed 100000
-          → Notification queued
-
-Time 5ms: Consumer processes notification 1
-          → HGETALL PORT|Eth0 → gets 100000 (latest, OK)
-Time 6ms: Consumer processes notification 2
-          → HGETALL PORT|Eth0 → gets 100000 (same, wasted work)
-Time 7ms: Consumer processes notification 3
-          → HGETALL PORT|Eth0 → gets 100000 (same, wasted work)
-```
-
-**Result:** 3 SAI calls for same final state (inefficient).
-
-### ConsumerStateTable Advantages
-
-#### 1. SET Followed by DEL (Safe)
-
-```
-Time 0ms: Producer: HSET _PORT_TABLE:Eth0 speed 100000
-                    SADD PORT_TABLE_KEY_SET Eth0
-
-Time 1ms: Producer: SADD PORT_TABLE_DEL_SET Eth0  (marks for deletion)
-                    SADD PORT_TABLE_KEY_SET Eth0  (already in set, no-op)
-
-Time 5ms: Consumer: pops() via Lua script
-          → SPOP KEY_SET → {Eth0}
-          → SREM DEL_SET Eth0 → returns 1 (was marked for del)
-          → DEL PORT_TABLE:Eth0 (delete real table)
-          → HGETALL _PORT_TABLE:Eth0 → returns {} (empty)
-          → Correctly interprets as DEL operation ✅
-```
-
-#### 2. Consumer Restart (Recoverable)
-
-```
-Time 0: Producer writes Eth0 → KEY_SET = {Eth0}
-Time 1: Producer writes Eth4 → KEY_SET = {Eth0, Eth4}
+Time 0: Consumer subscribed
+Time 1: HSET PORT|Eth0 → notification sent
 Time 2: Consumer crashes
-Time 3: Producer writes Eth8 → KEY_SET = {Eth0, Eth4, Eth8}
+Time 3: HSET PORT|Eth4 → notification lost! ❌
 Time 4: Consumer restarts
-Time 5: Consumer pops() → Gets ALL pending keys ✅
-
-KEY_SET and staging hashes PERSIST in Redis.
 ```
 
-#### 3. Rapid Updates (Efficient)
-
+**ConsumerStateTable (recovers):**
 ```
-Time 0ms: Producer: HSET _PORT_TABLE:Eth0 speed 10000
-                    SADD KEY_SET Eth0
-Time 1ms: Producer: HSET _PORT_TABLE:Eth0 speed 25000
-                    SADD KEY_SET Eth0  (already in set)
-Time 2ms: Producer: HSET _PORT_TABLE:Eth0 speed 100000
-                    SADD KEY_SET Eth0  (already in set)
-
-Time 5ms: Consumer: pops()
-          → SPOP KEY_SET → {Eth0}  (only ONE entry)
-          → HGETALL _PORT_TABLE:Eth0 → gets 100000 (latest)
-          → ONE SAI call with final state ✅
+Time 0-3: Producer writes → KEY_SET = {Eth0, Eth4, Eth8}
+Time 4: Consumer restarts
+Time 5: pops() → Gets ALL pending keys ✅
 ```
 
-### Full Pros/Cons Comparison
+### Full Comparison
 
 | Aspect | ConsumerStateTable | NotificationConsumer | SubscriberStateTable |
 |--------|-------------------|---------------------|---------------------|
@@ -662,77 +497,15 @@ Time 5ms: Consumer: pops()
 | **Buffer overflow** | ✅ KEY_SET unlimited | ❌ Buffer limited | ❌ Buffer limited |
 | **Producer coupling** | ❌ ProducerStateTable | ❌ NotificationProducer | ✅ Any client |
 | **Setup complexity** | ⚠️ More complex | ✅ Simple | ✅ Simple |
-| **Storage overhead** | ⚠️ Staging + sets | ✅ None | ✅ None |
-| **Latency** | ⚠️ Lua script | ✅ Direct | ✅ Direct |
-| **Best use case** | Table sync | Async events | Table monitoring |
+| **Best use case** | Table sync (APPL_DB) | Async events (SAI) | Table monitoring |
 
 ### Why SONiC Uses Each
 
-#### APPL_DB → ConsumerStateTable
-
-```
-High-volume, critical path:
-- Route updates (millions of routes)
-- Port configuration
-- Neighbor entries
-
-Requirements:
-- Cannot lose any update
-- Must handle producer faster than consumer
-- Must survive restarts
-- Atomicity needed
-```
-
-#### SAI Events → NotificationConsumer
-
-```
-Asynchronous hardware events:
-- Port oper status changes
-- FDB learn/age events
-- BFD session state changes
-- PFC watchdog events
-
-Requirements:
-- Data must be captured at event time
-- Cannot fetch later (state may change)
-- Event ordering preserved
-- Self-contained messages
-```
-
-#### CONFIG_DB / STATE_DB → SubscriberStateTable
-
-```
-Lower-volume, less critical:
-- Configuration changes (human-initiated)
-- State monitoring
-
-Acceptable trade-offs:
-- Config changes are rare
-- Operator can re-apply if missed
-- Simplicity over reliability
-- Any tool can write (CLI, REST API)
-```
-
----
-
-## Redis Data Structures
-
-### ConsumerStateTable (APPL_DB)
-
-| Redis Key | Type | Written By | Read By | Purpose |
-|-----------|------|------------|---------|---------|
-| `_PORT_TABLE:Ethernet0` | HASH | Producer | Consumer | **Staging area** (temporary) |
-| `PORT_TABLE:Ethernet0` | HASH | Consumer | Anyone | **Real table** (permanent) |
-| `PORT_TABLE_KEY_SET` | SET | Producer | Consumer | Queue of pending keys |
-| `PORT_TABLE_DEL_SET` | SET | Producer | Consumer | Keys marked for deletion |
-| `PORT_TABLE_CHANNEL@0` | PUBSUB | Producer | Consumer | Notification channel |
-
-### SubscriberStateTable (CONFIG_DB, STATE_DB)
-
-| Redis Key | Type | Written By | Read By | Purpose |
-|-----------|------|------------|---------|---------|
-| `PORT_TABLE\|Ethernet0` | HASH | Any client | Consumer | Actual table |
-| `__keyspace@N__:*` | PUBSUB | Redis (auto) | Consumer | Keyspace notifications |
+| Use Case | Consumer Class | Rationale |
+|----------|---------------|-----------|
+| **APPL_DB** | ConsumerStateTable | High-volume, cannot lose updates, must survive restarts |
+| **SAI Events** | NotificationConsumer | Data must be captured at event time, self-contained |
+| **CONFIG_DB** | SubscriberStateTable | Lower volume, operator can re-apply, any client can write |
 
 ---
 
@@ -740,9 +513,7 @@ Acceptable trade-offs:
 
 ### Multiple Producers, Single Consumer
 
-This model supports **multiple producers** but requires a **single consumer** per table.
-
-#### Multiple Producers (Safe)
+ConsumerStateTable supports **multiple producers** but requires **single consumer**:
 
 ```
 portsyncd (Producer 1)                    Redis
@@ -760,36 +531,23 @@ portmgrd (Producer 2)
                                      KEY_SET = {Eth0, Eth4}
 ```
 
-**Why it's safe:**
+**Multiple producers safe because:**
 - `SADD` is atomic
-- `HSET` on different keys is independent
-- `HSET` on same key - last writer wins (acceptable)
 - SET ensures no duplicate keys
+- Same key: last writer wins
 
-#### Single Consumer (Required)
-
-**Why only one consumer:**
-- `SPOP` is destructive - removes key from SET
+**Single consumer required because:**
+- `SPOP` is destructive
 - Lua script deletes staging hash after reading
-- Second consumer would find nothing
-- Ordering must be maintained for same key
 
-### Guaranteed No Missed Updates
-
-1. **KEY_SET is a Redis SET** - keys are unique, even if producer writes same key multiple times
-
-2. **Staging hash has latest value** - producer overwrites, consumer gets latest
-
-3. **Lua script is atomic** - no race condition during pop/read/write/delete
+### Guaranteed Delivery
 
 ```
-Producer updates speed three times:
+Time 0ms: HSET _PORT_TABLE:Eth0 speed 10000, SADD KEY_SET
+Time 1ms: HSET _PORT_TABLE:Eth0 speed 25000, SADD KEY_SET (no-op)
+Time 2ms: HSET _PORT_TABLE:Eth0 speed 100000, SADD KEY_SET (no-op)
 
-Time 0ms: HSET _PORT_TABLE:Ethernet0 speed 10000   →  staging has 10000
-Time 1ms: HSET _PORT_TABLE:Ethernet0 speed 25000   →  staging has 25000
-Time 2ms: HSET _PORT_TABLE:Ethernet0 speed 100000  →  staging has 100000
-
-Time 5ms: Consumer pops → HGETALL _PORT_TABLE:Ethernet0 → gets 100000 (latest!)
+Time 5ms: Consumer pops → KEY_SET has ONE entry → gets 100000 (latest) ✅
 ```
 
 ---
@@ -805,6 +563,9 @@ Selectable (swss-common)
                     ├── ConsumerStateTable
                     └── SubscriberStateTable
 
+Selectable (swss-common)
+    └── NotificationConsumer
+
 Executor (orch.h:106)
     └── ConsumerBase (orch.h:155)
             └── Consumer (orch.h:230)
@@ -816,13 +577,12 @@ Executor (orch.h:106)
 |------|---------|
 | `orchagent/orchdaemon.cpp` | Main event loop |
 | `orchagent/orch.cpp` | Orch base class, Consumer::execute() |
-| `orchagent/orch.h` | Class definitions |
 | `orchagent/portsorch.cpp` | PortsOrch::doPortTask() |
-| `sonic-swss-common/common/select.cpp` | Select class implementation |
-| `sonic-swss-common/common/redisselect.cpp` | RedisSelect::readData() |
-| `sonic-swss-common/common/consumerstatetable.cpp` | ConsumerStateTable::pops() |
-| `sonic-swss-common/common/subscriberstatetable.cpp` | SubscriberStateTable implementation |
-| `sonic-swss-common/common/consumer_state_table_pops.lua` | Atomic pop Lua script |
+| `sonic-swss-common/common/select.cpp` | Select class |
+| `sonic-swss-common/common/consumerstatetable.cpp` | ConsumerStateTable |
+| `sonic-swss-common/common/subscriberstatetable.cpp` | SubscriberStateTable |
+| `sonic-swss-common/common/notificationconsumer.cpp` | NotificationConsumer |
+| `sonic-swss-common/common/consumer_state_table_pops.lua` | Atomic pop script |
 
 ### Execution Flow
 
@@ -832,26 +592,23 @@ OrchDaemon::start()
     └─► Select::select()
             │
             ├─► epoll_wait()
-            ├─► Selectable::readData()    // Count notifications
+            ├─► Selectable::readData()
             └─► returns Selectable*
                     │
                     ▼
             Consumer::execute()           // orch.cpp:503
                 │
-                ├─► pops()                // Fetch data from Redis
+                ├─► pops()                // Fetch data
                 ├─► addToSync()           // Queue in m_toSync
-                └─► drain()               // orch.cpp:556
+                └─► drain()
                         │
                         ▼
                     Orch::doTask(Consumer&)
                         │
                         ▼
-                    PortsOrch::doTask()   // portsorch.cpp:6206
+                    PortsOrch::doTask()
                         │
-                        ▼
-                    doPortTask()          // portsorch.cpp:4301
-                        │
-                        └─► SAI API calls
+                        └─► doPortTask() → SAI API calls
 ```
 
 ### Complete Data Flow (ConsumerStateTable)
