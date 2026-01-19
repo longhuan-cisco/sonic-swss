@@ -443,11 +443,11 @@ redis-cli CONFIG SET notify-keyspace-events AKE
 
 | Scenario | ConsumerStateTable | SubscriberStateTable |
 |----------|-------------------|---------------------|
-| SET then quick DEL | Safe - reads from staging hash | **Data lost** - real table already deleted |
-| Multiple rapid updates | Gets latest value | May process stale intermediate states |
-| Consumer slow/blocked | Data persists in staging | **Notifications lost** (buffer overflow) |
-| Consumer restart | KEY_SET persists, can recover | **Missed notifications** during downtime |
-| Producer crash mid-write | Atomic Lua script | Partial state possible |
+| SET then quick DEL | ✅ Safe - reads from staging hash | ❌ **Data lost** - real table already deleted |
+| Multiple rapid updates | ✅ Gets latest value | ⚠️ May process stale intermediate states |
+| Consumer slow/blocked | ✅ Data persists in staging | ❌ **Notifications lost** (buffer overflow) |
+| Consumer restart | ✅ KEY_SET persists, can recover | ❌ **Missed notifications** during downtime |
+| Producer crash mid-write | ✅ Atomic Lua script | ⚠️ Partial state possible |
 
 ### SubscriberStateTable Failure Scenarios
 
@@ -571,17 +571,17 @@ Time 5ms: Consumer: pops()
 
 | Aspect | ConsumerStateTable | SubscriberStateTable |
 |--------|-------------------|---------------------|
-| **Reliability** | High | Lower |
-| **Data persistence** | Staging + KEY_SET persist | Notifications are transient |
-| **Crash recovery** | Full recovery | Missed during downtime |
-| **SET→DEL race** | Handled correctly | Data loss |
-| **Atomicity** | Lua script | None |
-| **Rapid updates** | Coalesced (efficient) | Each processed separately |
-| **Buffer overflow** | KEY_SET unlimited | Notification buffer limited |
-| **Producer coupling** | Must use ProducerStateTable | Any client works |
-| **Setup complexity** | More complex | Simple |
-| **Storage overhead** | Staging hash + sets | None |
-| **Latency** | Lua script overhead | Direct read |
+| **Reliability** | ✅ High | ⚠️ Lower |
+| **Data persistence** | ✅ Staging + KEY_SET persist | ❌ Notifications are transient |
+| **Crash recovery** | ✅ Full recovery | ❌ Missed during downtime |
+| **SET→DEL race** | ✅ Handled correctly | ❌ Data loss |
+| **Atomicity** | ✅ Lua script | ❌ None |
+| **Rapid updates** | ✅ Coalesced (efficient) | ⚠️ Each processed separately |
+| **Buffer overflow** | ✅ KEY_SET unlimited | ❌ Notification buffer limited |
+| **Producer coupling** | ❌ Must use ProducerStateTable | ✅ Any client works |
+| **Setup complexity** | ⚠️ More complex | ✅ Simple |
+| **Storage overhead** | ⚠️ Staging hash + sets | ✅ None |
+| **Latency** | ⚠️ Lua script overhead | ✅ Direct read |
 
 ### Why SONiC Uses Each
 
