@@ -1,4 +1,4 @@
-# SAI Port Lifecycle and SAI Redis Architecture
+# PortsOrch: SAI Port Lifecycle and Redis Communication
 
 > **Reference Commit:** [sonic-net/sonic-swss@f39134c](https://github.com/sonic-net/sonic-swss/tree/f39134cbb25b6cf27358437a88de6c55c6dc16a1)
 >
@@ -6,7 +6,7 @@
 
 ## Overview
 
-This document describes the lifecycle of ASIC_STATE:SAI_OBJECT_TYPE_PORT entries and the underlying SAI Redis communication architecture in SONiC.
+This document describes how PortsOrch manages SAI port objects, including the creation and deletion of `ASIC_STATE:SAI_OBJECT_TYPE_PORT` entries, and the underlying SAI Redis communication architecture between orchagent and syncd.
 
 ---
 
