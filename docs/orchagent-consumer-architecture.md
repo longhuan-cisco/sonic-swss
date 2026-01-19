@@ -340,9 +340,27 @@ void SubscriberStateTable::pops(...) {
 
 ## Redis Notification Mechanisms
 
-SONiC uses two different Redis notification mechanisms. Understanding their differences is crucial for understanding the reliability trade-offs.
+All three consumer mechanisms in SONiC are fundamentally based on **Redis Pub/Sub**. Redis Keyspace Notifications are a specialized form of pub/sub where Redis defines the payload format.
 
-### Redis Pub/Sub (used by ConsumerStateTable)
+```
+                        Redis Pub/Sub (foundation)
+                               │
+        ┌──────────────────────┼──────────────────────┐
+        │                      │                      │
+        ▼                      ▼                      ▼
+  Custom Channel         Custom Channel         Keyspace Notifications
+  Payload: "G"           Payload: JSON          Payload: key + event type
+  (signal only)          (full data)            (no values - Redis limitation)
+        │                      │                      │
+        ▼                      ▼                      ▼
+ConsumerStateTable    NotificationConsumer    SubscriberStateTable
+  + KEY_SET              (self-contained)       (must fetch data)
+  + Staging hash
+```
+
+**Key insight:** SubscriberStateTable's reliability limitations stem from Redis keyspace notifications only providing key + event type in the payload, not actual field values. If Redis keyspace notifications included the data values, SubscriberStateTable would be as reliable as NotificationConsumer.
+
+### Redis Pub/Sub with Signal (used by ConsumerStateTable)
 
 **Explicit messaging** - producer must explicitly publish.
 
@@ -415,24 +433,88 @@ redis-cli HSET "PORT|Ethernet0" speed 100000
 redis-cli CONFIG SET notify-keyspace-events AKE
 ```
 
+### Redis Pub/Sub with JSON Payload (used by NotificationConsumer)
+
+**Self-contained messages** - full data embedded in JSON payload.
+
+```
+Producer (syncd):                              Consumer (orchagent):
+PUBLISH NOTIFICATIONS '{"op":"port_state",     SUBSCRIBE NOTIFICATIONS
+  "data":"oid:0x1000", "state":"up"}'    ──►   receives full JSON data
+```
+
+#### Characteristics
+
+| Aspect | Description |
+|--------|-------------|
+| **Trigger** | Explicit `PUBLISH` command by producer |
+| **Content** | Full JSON payload with all event data |
+| **Channel** | Custom channel name (e.g., `NOTIFICATIONS`) |
+| **Coupling** | Producer must use `NotificationProducer` |
+| **Used by** | `syncd` → `orchagent` for SAI events |
+
+#### Example
+
+```bash
+# Producer (syncd)
+redis-cli PUBLISH NOTIFICATIONS '[["port_state_change","oid:0x1000"],["state","up"]]'
+
+# Consumer receives:
+1) "message"
+2) "NOTIFICATIONS"
+3) '[["port_state_change","oid:0x1000"],["state","up"]]'   # Full data in message!
+```
+
+#### Use Cases in Orchagent
+
+| Orch | Channel | Purpose |
+|------|---------|---------|
+| `PortsOrch` | NOTIFICATIONS | Port oper status changes from SAI |
+| `FdbOrch` | NOTIFICATIONS | FDB learn/age events from hardware |
+| `BfdOrch` | NOTIFICATIONS | BFD session state changes |
+| `PfcWdOrch` | NOTIFICATIONS | PFC watchdog events |
+| `MACsecOrch` | NOTIFICATIONS | MACsec completion events |
+| `SwitchOrch` | RESTARTCHECK | Warm restart check |
+
+#### Why NotificationConsumer for SAI Events?
+
+SAI events are **asynchronous hardware events** - the data exists only at the moment of the callback. The event data must be captured immediately.
+
+```
+Hardware event (link up)
+        │
+        ▼
+    SAI callback in syncd
+        │
+        ├─► Serialize event to JSON (captures state NOW)
+        └─► PUBLISH to NOTIFICATIONS channel
+                │
+                ▼
+        orchagent (NotificationConsumer)
+                │
+                └─► Data is IN the message (safe from race conditions)
+```
+
+If SubscriberStateTable were used, by the time orchagent reads the table, the port state might have changed again.
+
 ### Side-by-Side Comparison
 
-| Aspect | Pub/Sub | Keyspace Notifications |
-|--------|---------|------------------------|
-| **Notification trigger** | Explicit `PUBLISH` | Automatic on write |
-| **Producer awareness** | Must call `PUBLISH` | No awareness needed |
-| **Message content** | Producer-defined (`"G"`) | Key name + operation |
-| **Channel naming** | Custom (`TABLE_CHANNEL@0`) | Fixed (`__keyspace@N__:key`) |
-| **Key name in message** | No (must track separately) | Yes (in channel name) |
-| **Operation type** | No | Yes (`hset`, `del`, etc.) |
-| **Used in SONiC** | APPL_DB | CONFIG_DB, STATE_DB |
-| **Consumer class** | `ConsumerStateTable` | `SubscriberStateTable` |
+| Aspect | ConsumerStateTable | NotificationConsumer | SubscriberStateTable |
+|--------|-------------------|---------------------|---------------------|
+| **Subscription type** | Custom channel | Custom channel | Keyspace pattern |
+| **Notification trigger** | Explicit `PUBLISH` | Explicit `PUBLISH` | Automatic on write |
+| **Message content** | `"G"` (signal only) | Full JSON data | Key + event type |
+| **Data source** | Staging hash + KEY_SET | Message itself | Must fetch from table |
+| **SET→DEL race** | ✅ Safe | ✅ Safe | ❌ Data loss |
+| **Producer coupling** | Must use ProducerStateTable | Must use NotificationProducer | Any client works |
+| **Use case** | Table sync (APPL_DB) | Async events (SAI) | Table monitoring (CONFIG_DB) |
 
 ### Why readData() Differs Between Classes
 
 | Class | readData() behavior | Why |
 |-------|---------------------|-----|
 | `ConsumerStateTable` | Discards notification | Content is just `"G"` - useless |
+| `NotificationConsumer` | Saves and parses JSON | Full data is in message |
 | `SubscriberStateTable` | Saves notification | Contains key name - needed for `pops()` |
 
 ---
@@ -441,13 +523,13 @@ redis-cli CONFIG SET notify-keyspace-events AKE
 
 ### Overview
 
-| Scenario | ConsumerStateTable | SubscriberStateTable |
-|----------|-------------------|---------------------|
-| SET then quick DEL | ✅ Safe - reads from staging hash | ❌ **Data lost** - real table already deleted |
-| Multiple rapid updates | ✅ Gets latest value | ⚠️ May process stale intermediate states |
-| Consumer slow/blocked | ✅ Data persists in staging | ❌ **Notifications lost** (buffer overflow) |
-| Consumer restart | ✅ KEY_SET persists, can recover | ❌ **Missed notifications** during downtime |
-| Producer crash mid-write | ✅ Atomic Lua script | ⚠️ Partial state possible |
+| Scenario | ConsumerStateTable | NotificationConsumer | SubscriberStateTable |
+|----------|-------------------|---------------------|---------------------|
+| SET then quick DEL | ✅ Safe (staging) | ✅ Safe (data in msg) | ❌ **Data lost** |
+| Multiple rapid updates | ✅ Gets latest | ⚠️ Each processed | ⚠️ Each processed |
+| Consumer slow/blocked | ✅ Data persists | ❌ **Buffer overflow** | ❌ **Buffer overflow** |
+| Consumer restart | ✅ KEY_SET persists | ❌ **Missed** | ❌ **Missed** |
+| Producer crash mid-write | ✅ Atomic Lua | ✅ Atomic publish | ⚠️ Partial state |
 
 ### SubscriberStateTable Failure Scenarios
 
@@ -569,19 +651,20 @@ Time 5ms: Consumer: pops()
 
 ### Full Pros/Cons Comparison
 
-| Aspect | ConsumerStateTable | SubscriberStateTable |
-|--------|-------------------|---------------------|
-| **Reliability** | ✅ High | ⚠️ Lower |
-| **Data persistence** | ✅ Staging + KEY_SET persist | ❌ Notifications are transient |
-| **Crash recovery** | ✅ Full recovery | ❌ Missed during downtime |
-| **SET→DEL race** | ✅ Handled correctly | ❌ Data loss |
-| **Atomicity** | ✅ Lua script | ❌ None |
-| **Rapid updates** | ✅ Coalesced (efficient) | ⚠️ Each processed separately |
-| **Buffer overflow** | ✅ KEY_SET unlimited | ❌ Notification buffer limited |
-| **Producer coupling** | ❌ Must use ProducerStateTable | ✅ Any client works |
-| **Setup complexity** | ⚠️ More complex | ✅ Simple |
-| **Storage overhead** | ⚠️ Staging hash + sets | ✅ None |
-| **Latency** | ⚠️ Lua script overhead | ✅ Direct read |
+| Aspect | ConsumerStateTable | NotificationConsumer | SubscriberStateTable |
+|--------|-------------------|---------------------|---------------------|
+| **Reliability** | ✅ High | ⚠️ Medium | ⚠️ Lower |
+| **Data persistence** | ✅ Staging + KEY_SET | ❌ Transient | ❌ Transient |
+| **Crash recovery** | ✅ Full recovery | ❌ Missed | ❌ Missed |
+| **SET→DEL race** | ✅ Handled correctly | ✅ Data in message | ❌ Data loss |
+| **Atomicity** | ✅ Lua script | ✅ Single publish | ❌ None |
+| **Rapid updates** | ✅ Coalesced | ⚠️ Each processed | ⚠️ Each processed |
+| **Buffer overflow** | ✅ KEY_SET unlimited | ❌ Buffer limited | ❌ Buffer limited |
+| **Producer coupling** | ❌ ProducerStateTable | ❌ NotificationProducer | ✅ Any client |
+| **Setup complexity** | ⚠️ More complex | ✅ Simple | ✅ Simple |
+| **Storage overhead** | ⚠️ Staging + sets | ✅ None | ✅ None |
+| **Latency** | ⚠️ Lua script | ✅ Direct | ✅ Direct |
+| **Best use case** | Table sync | Async events | Table monitoring |
 
 ### Why SONiC Uses Each
 
@@ -598,6 +681,22 @@ Requirements:
 - Must handle producer faster than consumer
 - Must survive restarts
 - Atomicity needed
+```
+
+#### SAI Events → NotificationConsumer
+
+```
+Asynchronous hardware events:
+- Port oper status changes
+- FDB learn/age events
+- BFD session state changes
+- PFC watchdog events
+
+Requirements:
+- Data must be captured at event time
+- Cannot fetch later (state may change)
+- Event ordering preserved
+- Self-contained messages
 ```
 
 #### CONFIG_DB / STATE_DB → SubscriberStateTable
