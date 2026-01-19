@@ -1,5 +1,9 @@
 # SAI Port Lifecycle and SAI Redis Architecture
 
+> **Reference Commit:** [sonic-net/sonic-swss@f39134c](https://github.com/sonic-net/sonic-swss/tree/f39134cbb25b6cf27358437a88de6c55c6dc16a1)
+>
+> Line numbers and code references in this document are based on the above commit.
+
 ## Overview
 
 This document describes the lifecycle of ASIC_STATE:SAI_OBJECT_TYPE_PORT entries and the underlying SAI Redis communication architecture in SONiC.
@@ -10,7 +14,7 @@ This document describes the lifecycle of ASIC_STATE:SAI_OBJECT_TYPE_PORT entries
 
 ### Primary Owner
 - **Component:** `PortsOrch` (orchagent)
-- **File:** `/home/user/sonic-swss/orchagent/portsorch.cpp`
+- **File:** `orchagent/portsorch.cpp`
 - **Global Instance:** `gPortsOrch` created in `orchdaemon.cpp:208`
 
 ### Infrastructure Chain
@@ -269,7 +273,7 @@ sai_port_api->create_ports() returns immediately
     ┌───────────────────────────────────────┐
     │  Only means: sairedis QUEUED the      │
     │  request in Redis pipeline            │
-    │                                        │
+    │                                       │
     │  syncd has NOT processed it yet!      │
     │  ASIC SDK has NOT been called yet!    │
     └───────────────────────────────────────┘
@@ -285,7 +289,7 @@ sai_port_api->create_ports() blocks until complete
             ▼
     ┌───────────────────────────────────────┐
     │  Means: Full round-trip complete      │
-    │                                        │
+    │                                       │
     │  ✓ syncd received request             │
     │  ✓ ASIC SDK processed it              │
     │  ✓ Response returned                  │
