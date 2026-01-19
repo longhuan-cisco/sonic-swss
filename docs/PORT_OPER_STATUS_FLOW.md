@@ -1,4 +1,4 @@
-# SONiC SWSS Operational Status Down Flow
+# SONiC SWSS Port Operational Status Flow
 
 > **Based on:** sonic-net/sonic-swss commit [`3ccfa62`](https://github.com/sonic-net/sonic-swss/tree/3ccfa6299c8722e528cd5eba50805f753c2b3177). Line numbers and code references may differ in other versions.
 
