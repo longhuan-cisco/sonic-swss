@@ -193,7 +193,18 @@ private:
 };
 ```
 
-### RedisSelect: Notification Counter Implementation
+### Consumer Class Implementations
+
+Different consumer classes implement `hasCachedData()` differently based on their buffering strategy.
+
+#### ConsumerStateTable & ConsumerTable (via RedisSelect)
+
+These classes inherit from `RedisSelect` through the inheritance chain:
+
+```
+ConsumerStateTable → ConsumerTableBase → TableConsumable → RedisSelect
+ConsumerTable      → ConsumerTableBase → TableConsumable → RedisSelect
+```
 
 ```cpp
 // redisselect.cpp (sonic-swss-common)
@@ -245,6 +256,96 @@ public:
 - `readData()` increments for each notification read from Redis
 - `updateAfterRead()` decrements after Select returns the Selectable
 - `hasCachedData()` returns true if more than one notification remains
+
+#### SubscriberStateTable (Dual Buffer)
+
+`SubscriberStateTable` overrides with its own implementation using two buffers:
+
+```cpp
+// subscriberstatetable.cpp (sonic-swss-common)
+class SubscriberStateTable : public ConsumerTableBase
+{
+private:
+    std::deque<KeyOpFieldsValuesTuple> m_buffer;                    // Processed entries
+    std::deque<std::shared_ptr<RedisReply>> m_keyspace_event_buffer; // Raw keyspace events
+
+public:
+    bool hasData() override
+    {
+        return m_buffer.size() > 0 || m_keyspace_event_buffer.size() > 0;
+    }
+
+    bool hasCachedData() override
+    {
+        return m_buffer.size() + m_keyspace_event_buffer.size() > 1;  // Combined count
+    }
+};
+```
+
+**Key difference**: Counts actual buffered items across both buffers.
+
+#### NotificationConsumer (Message Queue)
+
+`NotificationConsumer` uses a message queue:
+
+```cpp
+// notificationconsumer.cpp (sonic-swss-common)
+class NotificationConsumer : public Selectable
+{
+private:
+    std::queue<std::string> m_queue;  // Processed notification messages
+
+public:
+    bool hasData() override
+    {
+        return m_queue.size() > 0;
+    }
+
+    bool hasCachedData() override
+    {
+        return m_queue.size() > 1;  // More than one message queued
+    }
+};
+```
+
+#### ZmqConsumerStateTable (Always Re-insert)
+
+`ZmqConsumerStateTable` uses a **different strategy**:
+
+```cpp
+// zmqconsumerstatetable.h (sonic-swss-common)
+class ZmqConsumerStateTable : public Selectable
+{
+private:
+    std::queue<KeyOpFieldsValuesTuple> m_receivedOperationQueue;
+
+public:
+    bool hasData() override
+    {
+        std::lock_guard<std::mutex> lock(m_receivedQueueMutex);
+        return !m_receivedOperationQueue.empty();
+    }
+
+    bool hasCachedData() override
+    {
+        return hasData();  // NOTE: Returns true if ANY data exists
+    }
+};
+```
+
+**Key difference**: Returns `true` whenever there's any data, causing **always re-insert** until completely drained.
+
+#### Implementation Comparison
+
+| Class | hasCachedData() Logic | Re-insertion Behavior |
+|-------|----------------------|----------------------|
+| **ConsumerStateTable** | `m_queueLength > 1` | Re-insert if 2+ notifications |
+| **ConsumerTable** | `m_queueLength > 1` | Re-insert if 2+ notifications |
+| **SubscriberStateTable** | `buffers.size() > 1` | Re-insert if 2+ items |
+| **NotificationConsumer** | `m_queue.size() > 1` | Re-insert if 2+ messages |
+| **ZmqConsumerStateTable** | `hasData()` | **Always** re-insert if any data |
+
+The `> 1` pattern ensures re-insertion only if work remains after current iteration. ZmqConsumerStateTable always re-inserts, relying on `pops()` batch limit for fairness.
 
 ### Select::select() - The Entry Point
 
