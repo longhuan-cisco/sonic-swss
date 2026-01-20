@@ -947,6 +947,127 @@ const int portsorch_base_pri = 40; // HIGH
 
 ---
 
+## Orch, Selectable, and Consumer Architecture
+
+### One Orch Can Have Multiple Selectables
+
+Each Orch can subscribe to **multiple tables**, each wrapped in its own Consumer (Selectable):
+
+```cpp
+// orch.h - Each orch has a map of consumers
+class Orch
+{
+protected:
+    ConsumerMap m_consumerMap;  // table_name -> Executor (Consumer)
+};
+
+// orch.cpp - Returns ALL consumers for registration with Select
+vector<Selectable *> Orch::getSelectables()
+{
+    vector<Selectable *> selectables;
+    for (auto& it : m_consumerMap)
+        selectables.push_back(it.second.get());
+    return selectables;
+}
+```
+
+### Each Selectable Corresponds to One DB Table
+
+Each Consumer wraps a table-specific consumer class. The consumer class is chosen based on the database:
+
+```cpp
+// orch.cpp:1090-1098
+void Orch::addConsumer(DBConnector *db, string tableName, int pri)
+{
+    if (db->getDbName() != APPL_DB && db->getDbName() != APPL_STATE_DB) {
+        // STATE_DB, CONFIG_DB → SubscriberStateTable (keyspace notifications)
+        addExecutor(new Consumer(new SubscriberStateTable(db, tableName, ...), this, tableName));
+    } else {
+        // APPL_DB → ConsumerStateTable (producer-consumer pattern)
+        addExecutor(new Consumer(new ConsumerStateTable(db, tableName, gBatchSize, pri), this, tableName));
+    }
+}
+```
+
+### Consumer Class Selection by Database
+
+| Database | Consumer Class | Notification Mechanism | Typical Use |
+|----------|---------------|----------------------|-------------|
+| **APPL_DB** | ConsumerStateTable | Producer-consumer (KeySet) | Data from *syncd daemons |
+| **CONFIG_DB** | SubscriberStateTable | Redis keyspace notifications | User configuration |
+| **STATE_DB** | SubscriberStateTable | Redis keyspace notifications | System state |
+| **Notifications** | NotificationConsumer | Redis pub/sub | Events (port status, etc.) |
+| **ZMQ** | ZmqConsumerStateTable | ZeroMQ messaging | High-performance path |
+
+### Table Ownership: No Overlapping
+
+**Each table is owned by exactly one Orch** - there is no overlapping subscription. This ensures:
+- Clear ownership of configuration processing
+- No race conditions between orchs
+- Predictable notification routing
+
+### Architecture Diagram
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                              OrchDaemon                                       │
+│                                                                               │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐            │
+│  │    RouteOrch     │  │    PortsOrch     │  │     QosOrch      │            │
+│  │                  │  │                  │  │                  │            │
+│  │ Consumers:       │  │ Consumers:       │  │ Consumers:       │            │
+│  │ ┌──────────────┐ │  │ ┌──────────────┐ │  │ ┌──────────────┐ │            │
+│  │ │ ROUTE_TABLE  │ │  │ │ PORT_TABLE   │ │  │ │TC_TO_QUEUE_MAP│ │            │
+│  │ │ (APPL_DB)    │ │  │ │ (APPL_DB)    │ │  │ │ (CONFIG_DB)  │ │            │
+│  │ │ ConsumerST   │ │  │ │ ConsumerST   │ │  │ │ SubscriberST │ │            │
+│  │ └──────────────┘ │  │ └──────────────┘ │  │ └──────────────┘ │            │
+│  │ ┌──────────────┐ │  │ ┌──────────────┐ │  │ ┌──────────────┐ │            │
+│  │ │ LABEL_ROUTE  │ │  │ │ VLAN_TABLE   │ │  │ │ DSCP_TO_TC   │ │            │
+│  │ │ (APPL_DB)    │ │  │ │ (APPL_DB)    │ │  │ │ (CONFIG_DB)  │ │            │
+│  │ │ ConsumerST   │ │  │ │ ConsumerST   │ │  │ │ SubscriberST │ │            │
+│  │ └──────────────┘ │  │ └──────────────┘ │  │ └──────────────┘ │            │
+│  │                  │  │ ┌──────────────┐ │  │                  │            │
+│  │                  │  │ │ LAG_TABLE    │ │  │                  │            │
+│  │                  │  │ │ (APPL_DB)    │ │  │                  │            │
+│  │                  │  │ │ ConsumerST   │ │  │                  │            │
+│  │                  │  │ └──────────────┘ │  │                  │            │
+│  │                  │  │ ┌──────────────┐ │  │                  │            │
+│  │                  │  │ │PortStatusNtf│ │  │                  │            │
+│  │                  │  │ │ (ASIC_DB)    │ │  │                  │            │
+│  │                  │  │ │ Notif.Cons.  │ │  │                  │            │
+│  │                  │  │ └──────────────┘ │  │                  │            │
+│  └──────────────────┘  └──────────────────┘  └──────────────────┘            │
+│                                                                               │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐            │
+│  │   MonitorOrch    │  │     CrmOrch      │  │    NeighOrch     │            │
+│  │                  │  │                  │  │                  │            │
+│  │ Consumers:       │  │ Consumers:       │  │ Consumers:       │            │
+│  │ ┌──────────────┐ │  │ ┌──────────────┐ │  │ ┌──────────────┐ │            │
+│  │ │VNET_MONITOR  │ │  │ │ CRM_TABLE    │ │  │ │ NEIGH_TABLE  │ │            │
+│  │ │ (STATE_DB)   │ │  │ │ (CONFIG_DB)  │ │  │ │ (APPL_DB)    │ │            │
+│  │ │ SubscriberST │ │  │ │ SubscriberST │ │  │ │ ConsumerST   │ │            │
+│  │ └──────────────┘ │  │ └──────────────┘ │  │ └──────────────┘ │            │
+│  └──────────────────┘  └──────────────────┘  └──────────────────┘            │
+│                                                                               │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+Legend:
+  ConsumerST   = ConsumerStateTable (APPL_DB producer-consumer pattern)
+  SubscriberST = SubscriberStateTable (keyspace notifications)
+  Notif.Cons.  = NotificationConsumer (pub/sub notifications)
+```
+
+### Database Distribution Summary
+
+| Database | Primary Purpose | Consumer Class | Example Orchs |
+|----------|----------------|----------------|---------------|
+| **APPL_DB** | Data from *syncd daemons (fpmsyncd, portsyncd, etc.) | ConsumerStateTable | RouteOrch, NeighOrch, PortsOrch, FdbOrch |
+| **CONFIG_DB** | User/operator configuration | SubscriberStateTable | CrmOrch, QosOrch, AclOrch, MlagOrch |
+| **STATE_DB** | System state information | SubscriberStateTable | MonitorOrch, BfdMonitorOrch |
+| **ASIC_DB** | SAI notifications | NotificationConsumer | PortsOrch (port status), SwitchOrch |
+
+---
+
 ## References
 
 ### sonic-swss (this repository)
