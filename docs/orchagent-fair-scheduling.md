@@ -347,6 +347,52 @@ public:
 
 The `> 1` pattern ensures re-insertion only if work remains after current iteration. ZmqConsumerStateTable always re-inserts, relying on `pops()` batch limit for fairness.
 
+#### updateAfterRead() Implementation Comparison
+
+`updateAfterRead()` is called by `Select::poll_descriptors()` after a Selectable is chosen but before returning to orchagent:
+
+| Class | Inherits From | updateAfterRead() | Effect |
+|-------|--------------|-------------------|--------|
+| **ConsumerStateTable** | RedisSelect | `m_queueLength--` | Decrements notification counter |
+| **ConsumerTable** | RedisSelect | `m_queueLength--` | Decrements notification counter |
+| **SubscriberStateTable** | RedisSelect | `m_queueLength--` | **Unused** (see note below) |
+| **NotificationConsumer** | Selectable | `{}` (no-op) | Nothing |
+| **ZmqConsumerStateTable** | Selectable | `{}` (no-op) | Nothing |
+
+**SubscriberStateTable Inconsistency:**
+
+```cpp
+// SubscriberStateTable inherits from RedisSelect but has a mismatch:
+
+// readData() - OVERRIDDEN, does NOT update m_queueLength
+uint64_t SubscriberStateTable::readData() {
+    // Only populates m_keyspace_event_buffer
+    // Does NOT increment m_queueLength!
+}
+
+// hasCachedData() - OVERRIDDEN, does NOT use m_queueLength
+bool SubscriberStateTable::hasCachedData() {
+    return m_buffer.size() + m_keyspace_event_buffer.size() > 1;  // Uses buffer sizes
+}
+
+// updateAfterRead() - NOT OVERRIDDEN, inherited from RedisSelect
+void RedisSelect::updateAfterRead() {
+    m_queueLength--;  // Decrements a counter that's never incremented or checked!
+}
+```
+
+This is effectively dead code for SubscriberStateTable - `m_queueLength` is decremented but never used. The class works correctly because `hasCachedData()` is properly overridden to check actual buffer sizes.
+
+#### Full Method Consistency Check
+
+| Class | readData() updates | hasCachedData() checks | updateAfterRead() | Consistent? |
+|-------|-------------------|----------------------|-------------------|-------------|
+| **ConsumerStateTable** | `m_queueLength++` | `m_queueLength > 1` | `m_queueLength--` | ✓ Yes |
+| **ConsumerTable** | `m_queueLength++` | `m_queueLength > 1` | `m_queueLength--` | ✓ Yes |
+| **SubscriberStateTable** | buffer only | buffer sizes | `m_queueLength--` | ✗ No (dead code) |
+| **NotificationConsumer** | `m_queue.push()` | `m_queue.size() > 1` | no-op | ✓ Yes |
+| **ZmqConsumerStateTable** | queue only | `hasData()` | no-op | ✓ Yes |
+
 #### Critical: readData() vs pops() Data Sources
 
 A key architectural detail is whether `readData()` and `pops()` operate on the **same buffer**:
