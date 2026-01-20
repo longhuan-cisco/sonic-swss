@@ -7,11 +7,12 @@ This document explains how orchagent ensures fair scheduling for different datab
 1. [Overview](#overview)
 2. [Main Event Loop](#main-event-loop)
 3. [Two-Stage Mechanism: readData and pops](#two-stage-mechanism-readdata-and-pops)
-4. [Fairness Mechanisms](#fairness-mechanisms)
-5. [Retry Task Processing](#retry-task-processing)
-6. [BGP Routes: A Real-World Example](#bgp-routes-a-real-world-example)
-7. [Key Configuration Parameters](#key-configuration-parameters)
-8. [Summary](#summary)
+4. [Select Class Internals (sonic-swss-common)](#select-class-internals-sonic-swss-common)
+5. [Fairness Mechanisms](#fairness-mechanisms)
+6. [Retry Task Processing](#retry-task-processing)
+7. [BGP Routes: A Real-World Example](#bgp-routes-a-real-world-example)
+8. [Key Configuration Parameters](#key-configuration-parameters)
+9. [Summary](#summary)
 
 ---
 
@@ -130,16 +131,374 @@ readData()  →  pops()  →  addToSync()  →  drain()  →  doTask()
 
 **Key Insight**: The expensive part is `drain()` which calls `doTask(Consumer&)` - this is where actual SAI API calls happen. The `pops()` batch limit acts as a **throttle gate** for `drain()`.
 
-### The Glue: hasCachedData()
+---
+
+## Select Class Internals (sonic-swss-common)
+
+This section explains how the `Select` class implements fair scheduling using `readData()`, `hasCachedData()`, and priority-based selection.
+
+### Core Data Structures
 
 ```cpp
-// orch.h:121
-bool hasCachedData() override { return m_selectable->hasCachedData(); }
+// select.h (sonic-swss-common)
+class Select
+{
+private:
+    int m_epoll_fd;                                    // epoll file descriptor
+    std::unordered_map<int, Selectable *> m_objects;   // fd -> Selectable mapping
+    std::set<Selectable *, Select::cmp> m_ready;       // Priority-ordered ready set
+
+    // Priority comparator for m_ready set
+    struct cmp
+    {
+        bool operator()(const Selectable* a, const Selectable* b) const
+        {
+            // 1. Higher priority wins
+            if (a->getPri() > b->getPri()) return true;
+            if (a->getPri() < b->getPri()) return false;
+
+            // 2. If same priority: least recently used wins (fair scheduling)
+            if (a->getLastUsedTime() < b->getLastUsedTime()) return true;
+            if (a->getLastUsedTime() > b->getLastUsedTime()) return false;
+
+            return false;
+        }
+    };
+};
 ```
 
-- Returns `true` if internal buffer still has unprocessed data
-- Allows Select to return the same consumer again if it has more buffered data
-- Enables draining large buffers across multiple iterations
+**Key insight**: The `m_ready` set is ordered by:
+1. **Priority** (higher first)
+2. **Last used time** (older first, for fairness among same priority)
+
+### Selectable Interface
+
+```cpp
+// selectable.h (sonic-swss-common)
+class Selectable
+{
+public:
+    virtual int getFd() = 0;              // File descriptor for epoll
+    virtual uint64_t readData() = 0;      // Read from fd into internal buffer
+
+    virtual bool hasData() { return true; }        // Has data to process?
+    virtual bool hasCachedData() { return false; } // Has MORE data after this read?
+    virtual void updateAfterRead() { }             // Called after data is consumed
+
+    int getPri() const { return m_priority; }
+
+private:
+    int m_priority;
+    std::chrono::time_point<std::chrono::steady_clock> m_last_used_time;
+};
+```
+
+### RedisSelect: Notification Counter Implementation
+
+```cpp
+// redisselect.cpp (sonic-swss-common)
+class RedisSelect : public Selectable
+{
+protected:
+    long long int m_queueLength;  // Notification counter
+
+public:
+    uint64_t readData() override
+    {
+        redisReply *reply = nullptr;
+
+        // Read first reply (blocking read that triggered epoll)
+        redisGetReply(m_subscribe->getContext(), &reply);
+        freeReplyObject(reply);
+        m_queueLength++;
+
+        // Drain any additional buffered replies (non-blocking)
+        do {
+            status = redisGetReplyFromReader(m_subscribe->getContext(), &reply);
+            if (reply != nullptr && status == REDIS_OK) {
+                m_queueLength++;
+                freeReplyObject(reply);
+            }
+        } while (reply != nullptr && status == REDIS_OK);
+
+        return 0;
+    }
+
+    bool hasData() override
+    {
+        return m_queueLength > 0;  // Has at least one notification
+    }
+
+    bool hasCachedData() override
+    {
+        return m_queueLength > 1;  // Has MORE than one notification
+    }
+
+    void updateAfterRead() override
+    {
+        m_queueLength--;  // Decrement after each select() return
+    }
+};
+```
+
+**Key insight**: `m_queueLength` tracks pending notifications:
+- `readData()` increments for each notification read from Redis
+- `updateAfterRead()` decrements after Select returns the Selectable
+- `hasCachedData()` returns true if more than one notification remains
+
+### Select::select() - The Entry Point
+
+```cpp
+// select.cpp (sonic-swss-common)
+int Select::select(Selectable **c, int timeout, bool interrupt_on_signal)
+{
+    *c = NULL;
+
+    // FIRST: Check if any selectable already has cached data (non-blocking)
+    int ret = poll_descriptors(c, 0);  // timeout=0: immediate return
+
+    // Return immediately if we have data, error, or caller wanted non-blocking
+    if (ret != Select::TIMEOUT || timeout == 0)
+        return ret;
+
+    // SECOND: Wait for new data with actual timeout
+    ret = poll_descriptors(c, timeout, interrupt_on_signal);
+
+    return ret;
+}
+```
+
+**Two-phase approach**:
+1. First check for already-cached data (from previous `hasCachedData()` re-insertions)
+2. Only block on epoll if no cached data exists
+
+### Select::poll_descriptors() - The Core Logic
+
+```cpp
+// select.cpp (sonic-swss-common)
+int Select::poll_descriptors(Selectable **c, unsigned int timeout, bool interrupt_on_signal)
+{
+    int sz_selectables = static_cast<int>(m_objects.size());
+    std::vector<struct epoll_event> events(sz_selectables);
+
+    // ┌─────────────────────────────────────────────────────────────┐
+    // │ STEP 1: epoll_wait - Wait for fd events                     │
+    // └─────────────────────────────────────────────────────────────┘
+    int ret = ::epoll_wait(m_epoll_fd, events.data(), sz_selectables, timeout);
+
+    if (ret < 0)
+        return Select::ERROR;
+
+    // ┌─────────────────────────────────────────────────────────────┐
+    // │ STEP 2: readData() - Buffer notifications from ready fds    │
+    // └─────────────────────────────────────────────────────────────┘
+    for (int i = 0; i < ret; ++i)
+    {
+        int fd = events[i].data.fd;
+        Selectable* sel = m_objects[fd];
+
+        sel->readData();      // Read from Redis into internal buffer
+        m_ready.insert(sel);  // Add to priority-ordered ready set
+    }
+
+    // ┌─────────────────────────────────────────────────────────────┐
+    // │ STEP 3: Select highest priority Selectable with data        │
+    // └─────────────────────────────────────────────────────────────┘
+    while (!m_ready.empty())
+    {
+        auto sel = *m_ready.begin();  // Highest priority (due to comparator)
+        m_ready.erase(sel);
+
+        sel->updateLastUsedTime();    // Update for fair scheduling
+
+        // Skip if no actual data (edge case)
+        if (!sel->hasData())
+            continue;
+
+        *c = sel;  // Return this selectable
+
+        // ┌─────────────────────────────────────────────────────────┐
+        // │ STEP 4: Re-insert if more cached data remains           │
+        // └─────────────────────────────────────────────────────────┘
+        if (sel->hasCachedData())
+        {
+            m_ready.insert(sel);  // Will be selected again (with updated time)
+        }
+
+        sel->updateAfterRead();  // Decrement notification counter
+
+        return Select::OBJECT;
+    }
+
+    return Select::TIMEOUT;
+}
+```
+
+### Complete Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Select::select() Entry                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ poll_descriptors(timeout=0)         │  Check for already-cached data        │
+│   - Skip epoll_wait (timeout=0)     │  from previous hasCachedData()        │
+│   - Check m_ready set               │  re-insertions                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                     ┌────────────────┴────────────────┐
+                     │                                 │
+              [has cached data]                 [no cached data]
+                     │                                 │
+                     ▼                                 ▼
+              Return immediately          ┌───────────────────────────────────┐
+                                          │ poll_descriptors(timeout=1000ms)  │
+                                          └───────────────────────────────────┘
+                                                       │
+                                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    STEP 1: epoll_wait()                                      │
+│                                                                              │
+│   Block until one or more fds have data (or timeout)                        │
+│   Returns: list of ready file descriptors                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    STEP 2: readData() on each ready fd                       │
+│                                                                              │
+│   for each ready_fd:                                                        │
+│       selectable = m_objects[ready_fd]                                      │
+│       selectable->readData()     ← Reads Redis replies, increments counter  │
+│       m_ready.insert(selectable) ← Add to priority-ordered set              │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    STEP 3: Pick highest priority from m_ready                │
+│                                                                              │
+│   m_ready is std::set with custom comparator:                               │
+│     1. Higher m_priority first                                              │
+│     2. If equal priority: older m_last_used_time first (fairness)           │
+│                                                                              │
+│   sel = *m_ready.begin()         ← Get highest priority                     │
+│   m_ready.erase(sel)                                                        │
+│   sel->updateLastUsedTime()      ← Mark as "just used" for fairness         │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    STEP 4: Check hasCachedData()                             │
+│                                                                              │
+│   if (sel->hasCachedData())      ← m_queueLength > 1 ?                       │
+│       m_ready.insert(sel)        ← Re-insert for next iteration             │
+│                                    (with updated lastUsedTime)              │
+│                                                                              │
+│   sel->updateAfterRead()         ← Decrement m_queueLength                  │
+│   return sel                     ← Return to orchagent                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Back to OrchDaemon::start()                               │
+│                                                                              │
+│   Executor* c = (Executor*)sel;                                             │
+│   c->execute();                  ← Calls pops() + addToSync() + drain()     │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### hasCachedData() Re-insertion Example
+
+```
+Scenario: RouteOrch consumer receives 300 notifications
+
+Time T1: epoll_wait returns (RouteOrch fd ready)
+         │
+         ▼
+    readData() on RouteOrch
+         - Reads all 300 Redis replies
+         - m_queueLength = 300
+         │
+         ▼
+    m_ready.insert(RouteOrch)
+         │
+         ▼
+    Pick RouteOrch (highest priority with data)
+         - updateLastUsedTime() → now
+         - hasCachedData()? → YES (300 > 1)
+         - m_ready.insert(RouteOrch)  ← RE-INSERTED
+         - updateAfterRead() → m_queueLength = 299
+         │
+         ▼
+    Return RouteOrch to orchagent
+         │
+         ▼
+    execute() → pops(128) → drain()  ← Process 128 routes
+         │
+         ▼
+Time T2: select() called again
+         │
+         ▼
+    poll_descriptors(timeout=0)  ← Non-blocking check first
+         - m_ready already contains RouteOrch (from re-insertion)
+         - No epoll_wait needed!
+         │
+         ▼
+    Pick RouteOrch again
+         - hasCachedData()? → YES (299 > 1)
+         - m_ready.insert(RouteOrch)  ← RE-INSERTED again
+         - updateAfterRead() → m_queueLength = 298
+         │
+         ▼
+    ... continues until m_queueLength <= 1 ...
+```
+
+### Fair Scheduling with Same Priority
+
+```
+Scenario: Two consumers (A and B) with same priority, both have data
+
+Time T1: Both A and B added to m_ready
+         m_ready order: [A, B] (A is older, selected first)
+         │
+         ▼
+    Select A
+         - updateLastUsedTime(A) → A.time = T1
+         - Return A
+         │
+         ▼
+Time T2: Both still have data, both in m_ready
+         m_ready order: [B, A] (B is now older than A)
+         │
+         ▼
+    Select B  ← Fair! B gets a turn
+         - updateLastUsedTime(B) → B.time = T2
+         │
+         ▼
+Time T3: Both still have data
+         m_ready order: [A, B] (A is now older than B)
+         │
+         ▼
+    Select A  ← Alternates fairly
+```
+
+This is validated by the unit test in `sonic-swss-common/tests/selectable_priority.cpp:246-249`:
+```cpp
+// "we have fair scheduler. we've read different selectables on the second read"
+EXPECT_NE(selectcs1, selectcs2);
+```
+
+### Interface Summary
+
+| Method | When Called | What It Does |
+|--------|-------------|--------------|
+| `readData()` | By `poll_descriptors()` after epoll | Read from Redis, increment `m_queueLength` |
+| `hasData()` | By `poll_descriptors()` before returning | Check if `m_queueLength > 0` |
+| `hasCachedData()` | By `poll_descriptors()` after selection | Check if `m_queueLength > 1`, re-insert if true |
+| `updateAfterRead()` | By `poll_descriptors()` before return | Decrement `m_queueLength` |
+| `updateLastUsedTime()` | By `poll_descriptors()` on selection | Update timestamp for fair scheduling |
 
 ---
 
@@ -351,8 +710,19 @@ const int portsorch_base_pri = 40; // HIGH
 
 ## References
 
+### sonic-swss (this repository)
+
 - `orchagent/orchdaemon.cpp:911-1050` - Main event loop
 - `orchagent/orch.cpp:503-518` - Consumer::execute() with pops()
 - `orchagent/orch.cpp:836-849` - Orch::doTask() with retryToSync()
 - `orchagent/orch.h:119-123` - Executor decorator methods
 - `fpmsyncd/routesync.cpp` - BGP route producer
+
+### sonic-swss-common
+
+- `common/select.cpp` - Select class with poll_descriptors() implementation
+- `common/select.h` - Select class with m_ready set and priority comparator
+- `common/selectable.h` - Selectable interface (readData, hasCachedData, etc.)
+- `common/redisselect.cpp` - RedisSelect with m_queueLength counter
+- `common/consumerstatetable.cpp` - ConsumerStateTable pops() implementation
+- `tests/selectable_priority.cpp` - Unit tests for priority and fair scheduling
