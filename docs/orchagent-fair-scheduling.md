@@ -410,6 +410,34 @@ readData():                              pops():
 3. **Batch control**: `POP_BATCH_SIZE` enforced at Redis level
 4. **Trade-off**: `hasCachedData()` is approximate, but `pops()` batch limit ensures fairness regardless
 
+#### Critical Timing: hasCachedData() is Checked BEFORE pops()
+
+A crucial detail is **when** `hasCachedData()` is evaluated relative to `pops()`:
+
+```
+Timeline:
+─────────────────────────────────────────────────────────────────────────────
+1. Select::poll_descriptors()
+   │
+   ├─ readData()              ← Buffer notifications / increment counter
+   ├─ hasCachedData()         ← Checked HERE (BEFORE pops!)
+   ├─ updateAfterRead()       ← Decrement counter
+   └─ return selectable to orchagent
+
+2. Consumer::execute()
+   │
+   └─ pops(128)               ← Actual data extraction happens HERE (AFTER!)
+      └─ drain()              ← Processing happens here
+─────────────────────────────────────────────────────────────────────────────
+```
+
+**Implication**: `hasCachedData()` serves as a **hint** that there might be more work, but it is **not a precise indicator** of remaining items:
+
+- For **ConsumerStateTable**: The hint is based on notification count, which may not reflect actual Redis data
+- For **SubscriberStateTable/NotificationConsumer**: The hint is based on buffer size before `pops()` drains it
+
+**The `pops()` batch limit is the true fairness enforcer**, not `hasCachedData()`. Even if `hasCachedData()` incorrectly returns false (causing no re-insertion), the next Redis notification will trigger a new `readData()` cycle. Conversely, if it incorrectly returns true, the batch limit still caps work per iteration.
+
 ### Select::select() - The Entry Point
 
 ```cpp
@@ -866,9 +894,10 @@ const int portsorch_base_pri = 40; // HIGH
 
 1. **Notification detection is decoupled from processing** - `readData()` buffers, `drain()` processes
 2. **pops() batch limit is the primary throttle** - gates how much work enters expensive `drain()`
-3. **doTask() loop exists for retry tasks** - they have no Redis fd to trigger Select
-4. **Priorities favor time-critical operations** - ports > routes
-5. **1000ms timeout ensures liveness** - no orch completely starved
+3. **hasCachedData() is a hint, not precise** - checked BEFORE `pops()`, based on notification count (not actual data remaining)
+4. **doTask() loop exists for retry tasks** - they have no Redis fd to trigger Select
+5. **Priorities favor time-critical operations** - ports > routes
+6. **1000ms timeout ensures liveness** - no orch completely starved
 
 ---
 
