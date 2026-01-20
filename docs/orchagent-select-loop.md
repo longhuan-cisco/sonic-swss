@@ -1,6 +1,10 @@
-# Orchagent Fair Scheduling for DB/Table Notifications
+# Orchagent Select Loop: Architecture and Fair Scheduling
 
-This document explains how orchagent ensures fair scheduling for different database/table notifications and their corresponding orchestration agents (orchs) in its selectable loop.
+This document explains the orchagent event processing architecture, including:
+- **Orch/Selectable/Consumer hierarchy**: How orchs subscribe to DB tables via consumers
+- **Select class internals**: Priority-based scheduling with `m_ready` set and `hasCachedData()` re-insertion
+- **Two-stage mechanism**: Decoupling notification detection (`readData`) from processing (`drain`)
+- **Fair scheduling**: Batch limits, priorities, and timeout guarantees to prevent starvation
 
 ## Table of Contents
 
