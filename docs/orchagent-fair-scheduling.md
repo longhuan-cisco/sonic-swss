@@ -347,6 +347,69 @@ public:
 
 The `> 1` pattern ensures re-insertion only if work remains after current iteration. ZmqConsumerStateTable always re-inserts, relying on `pops()` batch limit for fairness.
 
+#### Critical: readData() vs pops() Data Sources
+
+A key architectural detail is whether `readData()` and `pops()` operate on the **same buffer**:
+
+| Class | readData() target | pops() source | Same buffer? |
+|-------|------------------|---------------|--------------|
+| **ConsumerStateTable** | `m_queueLength` (notification counter) | Redis Lua script (direct query) | **NO** |
+| **ConsumerTable** | `m_queueLength` (notification counter) | Redis Lua script (direct query) | **NO** |
+| **SubscriberStateTable** | `m_keyspace_event_buffer` | `m_keyspace_event_buffer` | **YES** |
+| **NotificationConsumer** | `m_queue` | `m_queue` | **YES** |
+| **ZmqConsumerStateTable** | `m_receivedOperationQueue` | `m_receivedOperationQueue` | **YES** |
+
+**ConsumerStateTable/ConsumerTable Design:**
+
+```
+readData():                              pops():
+┌──────────────────────────┐            ┌──────────────────────────┐
+│ Redis SUBSCRIBE channel  │            │ EVALSHA Lua script       │
+│ (notification socket)    │            │ (direct Redis query)     │
+│                          │            │                          │
+│ m_queueLength++          │            │ Reads from Redis SET     │
+│ per notification         │            │ up to POP_BATCH_SIZE     │
+└──────────────────────────┘            └──────────────────────────┘
+         │                                        │
+         │ DIFFERENT DATA SOURCES                 │
+         └────────────────────────────────────────┘
+```
+
+**Implication**: For ConsumerStateTable, `hasCachedData()` checks `m_queueLength` (notification count), but this does NOT accurately reflect actual items in Redis:
+
+```
+Example:
+- 3 notifications arrive → m_queueLength = 3
+- But those 3 notifications could represent 5000 key changes in Redis
+- hasCachedData() returns: 3 > 1 = true
+- pops(128) fetches 128 items from Redis
+- 4872 items STILL in Redis, but m_queueLength is now 2
+
+The notification count is an APPROXIMATION, not an accurate indicator.
+```
+
+**SubscriberStateTable/NotificationConsumer/ZmqConsumerStateTable Design:**
+
+```
+readData():                              pops():
+┌──────────────────────────┐            ┌──────────────────────────┐
+│ Reads into buffer        │───────────▶│ Reads from SAME buffer   │
+│ (m_queue, m_buffer, etc) │            │                          │
+└──────────────────────────┘            └──────────────────────────┘
+                    │
+                    │ SAME DATA SOURCE
+                    │
+         hasCachedData() checks this buffer
+         → More accurate indicator
+```
+
+**Why ConsumerStateTable uses this design:**
+
+1. **Efficiency**: Data stays in Redis until needed; no memory duplication
+2. **Atomicity**: Lua script ensures atomic pop operations
+3. **Batch control**: `POP_BATCH_SIZE` enforced at Redis level
+4. **Trade-off**: `hasCachedData()` is approximate, but `pops()` batch limit ensures fairness regardless
+
 ### Select::select() - The Entry Point
 
 ```cpp
