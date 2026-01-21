@@ -18,10 +18,11 @@
   - [Comparison](#comparison)
   - [Migration Cost Analysis](#migration-cost-analysis)
 - [Modern Architecture Options](#modern-architecture-options)
-  - [Option 1: gRPC (Recommended)](#option-1-grpc-recommended)
+  - [Option 1: gRPC with Persistent Queue](#option-1-grpc-with-persistent-queue-revised)
   - [Option 2: Redis Streams + Lua](#option-2-redis-streams--lua)
-  - [Option 3: Hybrid gRPC + Redis](#option-3-hybrid-grpc--redis)
+  - [Option 3: Hybrid gRPC + Redis](#option-3-hybrid-grpc--redis-revised-for-individual-restart)
   - [Option 4: Shared Memory + Lock-free Queue](#option-4-shared-memory--lock-free-queue)
+  - [Option 5: ZMQ Direct Communication](#option-5-zmq-direct-communication-existing-in-sonic)
 - [Architecture Comparison Matrix](#architecture-comparison-matrix)
 - [Recommended Modern Design](#recommended-modern-design)
 - [Migration Path](#migration-path)
@@ -655,29 +656,138 @@ For ultra-low latency requirements:
 | Persistence | Requires memory-mapped file |
 | Portability | Platform-specific |
 
+### Option 5: ZMQ Direct Communication (Existing in SONiC)
+
+**Note: ZMQ mode already exists in SONiC as an alternative to Redis-based communication.**
+
+ZeroMQ (ZMQ) provides direct socket communication between orchagent and syncd, bypassing the Redis queue for lower latency:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    ZMQ Mode Architecture (Existing)                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌───────────┐    ZMQ PUSH/PULL (REQ/REP)    ┌───────────┐                 │
+│  │ orchagent │◄─────────────────────────────►│   syncd   │                 │
+│  │           │   tcp://127.0.0.1:5555        │           │                 │
+│  │  ZMQ      │   (SAI requests)              │  ZMQ      │                 │
+│  │  Client   │                               │  Server   │                 │
+│  │           │◄─────────────────────────────►│           │                 │
+│  │           │   tcp://127.0.0.1:5556        │           │                 │
+│  └─────┬─────┘   (SAI notifications)         └─────┬─────┘                 │
+│        │                                           │                       │
+│        │ (optional, if dbPersistence=true)         │                       │
+│        │         ┌─────────────┐                   │                       │
+│        └────────►│    Redis    │◄──────────────────┘                       │
+│                  │  HASH only  │  (async update for warm boot)             │
+│                  └─────────────┘                                           │
+│                                                                             │
+│  Configuration (context_config.json):                                       │
+│    "zmq_enable": true,                                                      │
+│    "zmq_endpoint": "tcp://127.0.0.1:5555",                                 │
+│    "zmq_ntf_endpoint": "tcp://127.0.0.1:5556"                              │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**ZMQ Flow Control (High Water Mark):**
+
+```cpp
+// ZMQ backpressure via HWM (High Water Mark)
+int hwm = 1000;  // Default: buffer up to 1000 messages
+zmq_setsockopt(socket, ZMQ_SNDHWM, &hwm, sizeof(hwm));
+
+// When HWM reached:
+// - zmq_send() returns EAGAIN, retries
+// - Eventually throws exception if still full
+
+// On disconnect:
+int linger = 0;  // ZMQ_LINGER=0 means drop pending messages
+zmq_setsockopt(socket, ZMQ_LINGER, &linger, sizeof(linger));
+```
+
+**ZMQ vs gRPC - Equivalent in This Analysis:**
+
+| Aspect | gRPC | ZMQ |
+|--------|------|-----|
+| **Flow control** | HTTP/2 window-based | High Water Mark (HWM) |
+| **When consumer slow** | Sender waits for window | Sender blocks at HWM |
+| **When consumer down** | Connection fails | ETERM, messages dropped |
+| **Persistence** | None | None |
+| **Latency** | ~10-50μs | ~10-50μs |
+| **Individual restart** | ✗ FAILS | ✗ FAILS |
+
+**Key Insight: ZMQ has the same limitation as gRPC:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    ZMQ Behavior During Syncd Restart                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  orchagent                                          syncd                   │
+│      │                                                │                     │
+│      │ ─── ZMQ PUSH ─────────────────────────────► │ ✓ processed          │
+│      │                                                │                     │
+│      │                                         *** CRASH ***               │
+│      │                                                                      │
+│      │ ─── ZMQ PUSH ─────────────────────────────► X                       │
+│      │     (buffers in HWM up to limit)               │                     │
+│      │                                                │                     │
+│      │ ─── ZMQ PUSH ─────────────────────────────► X                       │
+│      │     EAGAIN: HWM full, retry...                 │                     │
+│      │     Eventually: ETERM exception!               │                     │
+│      │                                                │                     │
+│      │     ZMQ_LINGER=0 → pending messages DROPPED   │                     │
+│      │                                                │                     │
+│      │     SAME PROBLEM AS gRPC: No persistence!     │                     │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**ZMQ's Optional `dbPersistence` Flag:**
+
+ZMQ mode has an optional flag to write to Redis HASH asynchronously:
+
+```cpp
+// ZmqConsumerStateTable constructor
+ZmqConsumerStateTable(db, tableName, zmqServer, popBatchSize, pri,
+                      dbPersistence);  // If true, async write to HASH
+
+// But note: This writes to HASH (state), NOT to LIST (queue)
+// So warm boot can see state, but no buffered queue for restart
+```
+
+**Conclusion for ZMQ:**
+- ZMQ is conceptually equivalent to gRPC for this analysis
+- Both provide direct communication with built-in flow control
+- Both **lack persistence** and **fail during individual docker restart**
+- ZMQ's `dbPersistence` writes to HASH (state), not LIST (queue)
+- ZMQ mode trades restart safety for lower latency
+
 ---
 
 ## Architecture Comparison Matrix
 
-| Criteria | Current (LIST+Pub/Sub) | Redis Streams | Pure gRPC | gRPC+Redis Queue | Shared Memory |
-|----------|------------------------|---------------|-----------|------------------|---------------|
-| **Latency (normal)** | ~100μs | ~100μs | ~10-50μs | ~10-50μs | ~1μs |
-| **Type safety** | None | None | Protobuf ✓ | Protobuf ✓ | Manual |
-| **Sync mode** | Extra code | Extra code | Native ✓ | Native ✓ | Native |
-| **Notifications** | Separate | Separate | Built-in ✓ | Built-in ✓ | Eventfd |
-| **Debugging** | redis-cli ✓ | redis-cli ✓ | grpcurl | redis-cli ✓ | Custom tools |
-| **Warm boot** | HASH ✓ | HASH ✓ | Need Redis | HASH ✓ | mmap file |
-| **Code complexity** | High (Lua) | Medium | Low ✓ | Medium | High |
-| **Schema evolution** | Manual | Manual | Protobuf ✓ | Protobuf ✓ | Manual |
-| **Existing in SONiC** | Yes ✓ | No | Yes (gNMI) | Partial | No |
-| **Multi-consumer** | No | Yes ✓ | Yes ✓ | Yes ✓ | No |
-| **Individual docker restart** | ✓ Queue buffers | ✓ Stream buffers | ✗ FAILS | ✓ Queue fallback | ✗ FAILS |
+| Criteria | Current (LIST+Pub/Sub) | Redis Streams | Pure gRPC | ZMQ (Existing) | gRPC+Redis Queue | Shared Memory |
+|----------|------------------------|---------------|-----------|----------------|------------------|---------------|
+| **Latency (normal)** | ~100μs | ~100μs | ~10-50μs | ~10-50μs | ~10-50μs | ~1μs |
+| **Type safety** | None | None | Protobuf ✓ | None | Protobuf ✓ | Manual |
+| **Flow control** | Redis handles | Redis handles | HTTP/2 window | HWM (1000 msg) | HTTP/2 + Redis | Manual |
+| **Sync mode** | Extra code | Extra code | Native ✓ | Native ✓ | Native ✓ | Native |
+| **Notifications** | Separate | Separate | Built-in ✓ | Separate socket | Built-in ✓ | Eventfd |
+| **Debugging** | redis-cli ✓ | redis-cli ✓ | grpcurl | Custom | redis-cli ✓ | Custom tools |
+| **Warm boot** | HASH ✓ | HASH ✓ | Need Redis | HASH (optional) | HASH ✓ | mmap file |
+| **Code complexity** | High (Lua) | Medium | Low ✓ | Medium | Medium | High |
+| **Existing in SONiC** | Yes ✓ | No | Yes (gNMI) | Yes ✓ | Partial | No |
+| **Multi-consumer** | No | Yes ✓ | Yes ✓ | No | Yes ✓ | No |
+| **Individual docker restart** | ✓ Queue buffers | ✓ Stream buffers | ✗ FAILS | ✗ FAILS | ✓ Queue fallback | ✗ FAILS |
 
 **Critical Row: Individual Docker Restart Support**
 
 The last row is the deciding factor given verified SONiC requirements:
-- Pure gRPC and Shared Memory **fail** during syncd restart (no buffering)
+- **Pure gRPC, ZMQ, and Shared Memory all FAIL** during syncd restart (no persistent buffering)
 - Any viable design **requires** persistent message buffering
+- ZMQ's optional `dbPersistence` writes to HASH only, not to a queue - doesn't help with restart
 
 ---
 
@@ -830,20 +940,28 @@ The recommended approach is **gRPC + Redis Fallback Queue**:
 3. **Redis HASH for state** - Warm boot recovery, debugging
 4. **Simpler Lua** - No complex atomic pop+HASH update (separated concerns)
 
-### Why Not Pure gRPC?
+### Why Not Pure gRPC or ZMQ?
 
-A common misconception is that modern designs should eliminate Redis entirely. However:
+A common misconception is that modern designs should eliminate Redis entirely. However, both gRPC and ZMQ (which already exists in SONiC) share the same fundamental limitation:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  Pure gRPC fails the individual docker restart requirement:                 │
+│  Pure gRPC/ZMQ fails the individual docker restart requirement:             │
+├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│  1. Syncd docker restarts                                                   │
-│  2. Orchagent continues running, sending gRPC requests                      │
-│  3. gRPC connection fails                                                   │
-│  4. Where do those requests go? → NOWHERE (lost!)                          │
+│  gRPC:                              ZMQ:                                    │
+│  1. Syncd restarts                  1. Syncd restarts                       │
+│  2. gRPC connection fails           2. ZMQ socket fails (ETERM)             │
+│  3. HTTP/2 window stops             3. HWM buffer fills, then drops         │
+│  4. Requests → LOST                 4. ZMQ_LINGER=0 → LOST                  │
 │                                                                             │
-│  With Redis fallback queue:                                                 │
+│  Both have flow control but NO persistence:                                 │
+│  • gRPC: HTTP/2 window-based flow control                                   │
+│  • ZMQ: High Water Mark (HWM) based flow control                           │
+│                                                                             │
+│  Neither survives consumer unavailability!                                  │
+│                                                                             │
+│  With Redis fallback queue (for either):                                    │
 │  4. Requests queued to Redis                                                │
 │  5. Syncd restarts, drains queue                                            │
 │  6. No messages lost ✓                                                      │
@@ -855,8 +973,11 @@ A common misconception is that modern designs should eliminate Redis entirely. H
 | Design | Normal Performance | Individual Restart | Recommended? |
 |--------|-------------------|-------------------|--------------|
 | Current (LIST+Pub/Sub) | Good | ✓ Supported | ✓ Proven |
+| ZMQ (Existing option) | Excellent | ✗ FAILS | ✗ No (same as gRPC) |
 | Pure gRPC | Excellent | ✗ FAILS | ✗ No |
 | gRPC + Redis Queue | Excellent | ✓ Supported | ✓ Best modern choice |
 | Redis Streams | Good | ✓ Supported | ✓ Alternative |
 
-The current design works well and is proven in production. If migrating, **gRPC + Redis Fallback Queue** provides better performance while maintaining the required restart resilience. Pure gRPC solutions are **not viable** for SONiC's documented requirements.
+**Key Insight:** ZMQ and gRPC are equivalent in this analysis - both are direct communication mechanisms with built-in flow control (HWM vs HTTP/2 window) but **no persistence**. Both fail the individual docker restart requirement.
+
+The current design works well and is proven in production. If migrating, **gRPC + Redis Fallback Queue** provides better performance while maintaining the required restart resilience. Pure direct-communication solutions (gRPC, ZMQ) are **not viable** for SONiC's documented requirements without a persistent fallback queue.
