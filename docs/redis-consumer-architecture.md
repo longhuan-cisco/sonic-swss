@@ -24,7 +24,8 @@ Orchagent is the core component in SONiC that translates high-level configuratio
 |-----------|----------|---------|
 | `Select` | swss-common | Event multiplexer using epoll |
 | `Selectable` | swss-common | Base interface for event sources |
-| `ConsumerStateTable` | swss-common | Consumes from APPL_DB (staging + KEY_SET pattern) |
+| `ConsumerTable` | swss-common | Consumes via LIST queue (ordered, no coalescing) |
+| `ConsumerStateTable` | swss-common | Consumes via KEY_SET + staging (coalescing) |
 | `SubscriberStateTable` | swss-common | Consumes via Redis keyspace notifications |
 | `NotificationConsumer` | swss-common | Consumes JSON messages via pub/sub |
 | `Consumer` | orchagent | Wrapper connecting a table to an Orch |
@@ -188,7 +189,7 @@ This prevents a single table with massive data from blocking others indefinitely
 
 ## Redis Notification Mechanisms
 
-All three consumer mechanisms are based on **Redis Pub/Sub**:
+All consumer mechanisms are based on **Redis Pub/Sub**:
 
 ```
                         Redis Pub/Sub (foundation)
@@ -201,14 +202,14 @@ All three consumer mechanisms are based on **Redis Pub/Sub**:
   (signal only)          (full data)            (no values)
         │                      │                      │
         ▼                      ▼                      ▼
-ConsumerStateTable    NotificationConsumer    SubscriberStateTable
-  + KEY_SET              (self-contained)       (must fetch data)
-  + Staging hash
+  ConsumerTable         NotificationConsumer    SubscriberStateTable
+  ConsumerStateTable      (self-contained)       (must fetch data)
+  (data in Redis)
 ```
 
-### 1. Pub/Sub with Signal (ConsumerStateTable)
+### 1. Pub/Sub with Signal + Queue (ConsumerTable / ConsumerStateTable)
 
-Producer publishes a simple signal; data stored separately.
+Producer publishes a simple signal; data stored separately in Redis.
 
 ```bash
 # Producer
@@ -219,6 +220,9 @@ PUBLISH PORT_TABLE_CHANNEL@0 "G"
 2) "PORT_TABLE_CHANNEL@0"
 3) "G"                        # Just a signal
 ```
+
+- **ConsumerTable** stores data in a LIST queue (ordered)
+- **ConsumerStateTable** stores data in KEY_SET + staging hash (coalesced)
 
 ### 2. Pub/Sub with JSON Payload (NotificationConsumer)
 
@@ -258,9 +262,73 @@ HSET "PORT|Ethernet0" speed 100000
 
 ## Consumer Classes
 
+### ConsumerTable
+
+Used for **ordered queue processing** - preserves operation order, no coalescing.
+
+Paired with **ProducerTable**.
+
+#### How It Works
+
+Uses a Redis **LIST** as a FIFO queue. Each entry contains (key, value, op) as three list elements.
+
+```
+Producer                                 Redis LIST
+   │
+   ├─► RPUSH TABLE_KEY_VALUE_OP_QUEUE key1
+   ├─► RPUSH TABLE_KEY_VALUE_OP_QUEUE value1_json
+   ├─► RPUSH TABLE_KEY_VALUE_OP_QUEUE "Sset"
+   └─► PUBLISH channel "G"
+                                    LIST = [key1, value1, op1, key2, value2, op2, ...]
+```
+
+#### pops() - Lua Script
+
+**File:** `sonic-swss-common/common/consumer_table_pops.lua`
+
+```lua
+local popsize = ARGV[1] * 3           -- key, value, op per entry
+local keys = redis.call('LRANGE', KEYS[1], -popsize, -1)
+redis.call('LTRIM', KEYS[1], 0, -popsize-1)
+
+for i = n, 1, -3 do
+   local op = keys[i-2]
+   local value = keys[i-1]              -- JSON encoded
+   local key = keys[i]
+
+   -- Decode JSON value
+   local jj = cjson.decode(value)
+
+   -- Write to real table (if op is set/create/remove)
+   if op == 'set' or op == 'SET' then
+       redis.call('HSET', tablename..key, ...)
+   elseif op == 'DEL' then
+       redis.call('DEL', tablename..key)
+   end
+end
+```
+
+#### Key Characteristics
+
+| Aspect | ConsumerTable |
+|--------|---------------|
+| Queue type | Redis LIST |
+| Ordering | ✅ FIFO preserved |
+| Coalescing | ❌ Every operation processed |
+| Bulk operations | ✅ Supports bulkset, bulkcreate, bulkremove |
+| Query/Response | ✅ Supports get, getresponse, flush, etc. |
+
+---
+
 ### ConsumerStateTable
 
 Used for **APPL_DB** - high-reliability table synchronization with coalescing.
+
+Paired with **ProducerStateTable**.
+
+#### How It Works
+
+Uses **KEY_SET** (Redis SET) + **staging hash**. Multiple updates to same key are coalesced.
 
 #### readData()
 
@@ -363,6 +431,8 @@ portmgrd (Producer 2)
 
 Used for **CONFIG_DB / STATE_DB** - simpler but less reliable.
 
+No paired producer - works with **any Redis client**.
+
 #### readData()
 
 The notification **contains the key name**, so it must be saved:
@@ -408,6 +478,8 @@ void SubscriberStateTable::pops(...) {
 ### NotificationConsumer
 
 Used for **SAI async events** from syncd - self-contained messages.
+
+Paired with **NotificationProducer**.
 
 #### readData()
 
@@ -476,22 +548,33 @@ SAI events are **asynchronous hardware events** - the data exists only at callba
 
 ### Full Comparison
 
-| Aspect | ConsumerStateTable | NotificationConsumer | SubscriberStateTable |
-|--------|-------------------|---------------------|---------------------|
-| **Reliability** | ✅ High | ⚠️ Medium | ⚠️ Lower |
-| **Data persistence** | ✅ Staging + KEY_SET | ❌ Transient | ❌ Transient |
-| **Crash recovery** | ✅ Full recovery | ❌ Missed | ❌ Missed |
-| **SET→DEL race** | ✅ Final state correct | ✅ Both events seen | ❌ Data loss |
-| **Coalescing** | ✅ Yes (efficient) | ❌ No (every event) | ❌ No (every event) |
-| **Atomicity** | ✅ Lua script | ✅ Single publish | ❌ None |
-| **Buffer overflow** | ✅ KEY_SET unlimited | ❌ Buffer limited | ❌ Buffer limited |
-| **Producer coupling** | ❌ Requires ProducerStateTable | ❌ Requires NotificationProducer | ✅ Any client |
-| **Best use case** | Table sync (APPL_DB) | Async events (SAI) | Table monitoring |
+| Aspect | ConsumerTable | ConsumerStateTable | NotificationConsumer | SubscriberStateTable |
+|--------|---------------|-------------------|---------------------|---------------------|
+| **Queue type** | LIST | SET + staging | In-memory queue | Event buffer |
+| **Ordering** | ✅ FIFO | ❌ Unordered | ✅ FIFO | ✅ FIFO |
+| **Coalescing** | ❌ No | ✅ Yes | ❌ No | ❌ No |
+| **Reliability** | ✅ High | ✅ High | ⚠️ Medium | ⚠️ Lower |
+| **Data persistence** | ✅ LIST persists | ✅ KEY_SET persists | ❌ Transient | ❌ Transient |
+| **Crash recovery** | ✅ Full | ✅ Full | ❌ Missed | ❌ Missed |
+| **SET→DEL race** | ✅ Both seen | ✅ Final state | ✅ Both seen | ❌ Data loss |
+| **Bulk operations** | ✅ Yes | ❌ No | ❌ No | ❌ No |
+| **Producer coupling** | ProducerTable | ProducerStateTable | NotificationProducer | Any client |
+| **Best use case** | Ordered ops | State sync | Async events | Monitoring |
+
+### ConsumerTable vs ConsumerStateTable
+
+| Aspect | ConsumerTable | ConsumerStateTable |
+|--------|---------------|-------------------|
+| **Use when** | Order matters, every op needed | Final state matters, coalescing OK |
+| **Example** | ASIC_STATE ops to syncd | PORT_TABLE config to orchagent |
+| **100 writes same key** | 100 entries processed | 1 entry (latest value) |
+| **Ordering** | ✅ Guaranteed FIFO | ❌ SET is unordered |
 
 ### Coalescing Behavior
 
 | Consumer Class | Notification Count vs Data Items | Fair Scheduling Accuracy |
 |----------------|----------------------------------|-------------------------|
+| **ConsumerTable** | 100 notifications = 100 ops | ✅ Accurate |
 | **ConsumerStateTable** | 100 notifications may = 5 keys (coalesced) | ⚠️ May have empty iterations |
 | **NotificationConsumer** | 100 notifications = 100 events | ✅ Accurate |
 | **SubscriberStateTable** | 100 notifications = 100 events | ✅ Accurate |
@@ -529,27 +612,25 @@ Time 5ms: Consumer pops() via Lua:
 
 **Note:** The SET event is "lost" (not processed separately), but the **final state is correct**. ConsumerStateTable is for state synchronization, not event tracking.
 
-#### Edge Case: SET→DEL→SET
+#### ConsumerTable (both events seen)
 
 ```
-Time 0ms: SET Eth0 speed=100000
-Time 1ms: DEL Eth0
-Time 2ms: SET Eth0 speed=200000
+Time 0ms: SET Eth0 → RPUSH to LIST
+Time 1ms: DEL Eth0 → RPUSH to LIST
 
-Consumer pops():
-  - SREM DEL_SET → 1
-  - DEL PORT_TABLE:Eth0          (delete first)
-  - HGETALL _PORT_TABLE:Eth0 → {speed: 200000}
-  - HSET PORT_TABLE:Eth0 speed 200000
-  - Returns: SET with speed=200000  ✅ Correct!
+Time 5ms: Consumer pops() via Lua:
+  - LRANGE gets both entries in order
+  - Entry 1: SET Eth0  ✅
+  - Entry 2: DEL Eth0  ✅
 ```
 
 ### When to Use Each
 
 | Need | Consumer Class | Rationale |
 |------|---------------|-----------|
+| Ordered operations | ConsumerTable | FIFO preserved, every op processed |
 | Final state sync | ConsumerStateTable | Coalescing efficient, correct final state |
-| Event tracking | NotificationConsumer | Every event preserved |
+| Async event tracking | NotificationConsumer | Self-contained, every event preserved |
 | Simple monitoring | SubscriberStateTable | OK for low-volume, non-critical |
 
 ---
@@ -562,6 +643,7 @@ Consumer pops():
 Selectable (swss-common)
     └── RedisSelect
             └── ConsumerTableBase
+                    ├── ConsumerTable
                     ├── ConsumerStateTable
                     └── SubscriberStateTable
 
@@ -580,7 +662,9 @@ Executor (orchagent)
 | `orchagent/orchdaemon.cpp` | Main event loop |
 | `orchagent/orch.cpp` | Orch base class, Consumer::execute() |
 | `sonic-swss-common/common/select.cpp` | Select class, fair scheduling |
+| `sonic-swss-common/common/consumertable.cpp` | ConsumerTable |
 | `sonic-swss-common/common/consumerstatetable.cpp` | ConsumerStateTable |
 | `sonic-swss-common/common/subscriberstatetable.cpp` | SubscriberStateTable |
 | `sonic-swss-common/common/notificationconsumer.cpp` | NotificationConsumer |
-| `sonic-swss-common/common/consumer_state_table_pops.lua` | Atomic pop script |
+| `sonic-swss-common/common/consumer_table_pops.lua` | ConsumerTable Lua script |
+| `sonic-swss-common/common/consumer_state_table_pops.lua` | ConsumerStateTable Lua script |
