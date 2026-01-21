@@ -328,7 +328,65 @@ Paired with **ProducerStateTable**.
 
 #### How It Works
 
-Uses **KEY_SET** (Redis SET) + **staging hash**. Multiple updates to same key are coalesced.
+Uses **KEY_SET** + **DEL_SET** + **staging hashes**. Multiple updates to same key are coalesced.
+
+#### Why This Design? (KEY_SET + DEL_SET + Staging Hashes)
+
+**Problem 1: Staging hashes are scattered (one per key)**
+
+```
+_PORT_TABLE:Ethernet0   ← one hash
+_PORT_TABLE:Ethernet4   ← another hash
+_PORT_TABLE:Ethernet8   ← another hash
+```
+
+Without KEY_SET, consumer would need `SCAN 0 MATCH _PORT_TABLE:*` to discover pending keys - expensive and non-atomic.
+
+**Solution:** KEY_SET acts as an **index/manifest** of all pending staging hashes.
+
+```
+KEY_SET = {Ethernet0, Ethernet4, Ethernet8}
+SPOP KEY_SET 128  ← O(1) per key, atomic
+```
+
+**Problem 2: DEL operation removes the staging hash**
+
+```
+SET Ethernet0:
+  HSET _PORT_TABLE:Ethernet0 speed 100000   ← staging hash created
+  SADD KEY_SET Ethernet0
+
+DEL Ethernet0:
+  DEL _PORT_TABLE:Ethernet0                  ← staging hash GONE
+  SADD KEY_SET Ethernet0                     ← still need to process this key
+  -- But how does consumer know it's a deletion?
+```
+
+**Solution:** DEL_SET marks keys that should be deleted.
+
+```
+DEL Ethernet0:
+  DEL _PORT_TABLE:Ethernet0
+  SADD DEL_SET Ethernet0                     ← marker for deletion
+  SADD KEY_SET Ethernet0
+```
+
+Consumer logic:
+```lua
+key = SPOP KEY_SET                -- "Ethernet0"
+if SREM DEL_SET key == 1 then     -- was in DEL_SET?
+    DEL real_table:key            -- yes, delete real table
+end
+fv = HGETALL staging:key          -- {} empty (staging was deleted)
+```
+
+**Summary:**
+
+| Structure | Purpose |
+|-----------|---------|
+| KEY_SET | Index of pending keys (discovery - avoids expensive SCAN) |
+| DEL_SET | Marker for deletions (staging hash is already gone) |
+| Staging hashes | Actual field-value data (one hash per key, prefix `_`) |
 
 #### readData()
 
