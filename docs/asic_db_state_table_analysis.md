@@ -1,5 +1,41 @@
 # ASIC DB State Table: Bridge Between Orchagent and Syncd
 
+## Table of Contents
+
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Data Structures](#data-structures)
+  - [1. LIST (Request Queue)](#1-list-request-queue)
+  - [2. HASH (State Snapshot)](#2-hash-state-snapshot)
+  - [3. Pub/Sub Channel](#3-pubsub-channel)
+- [Request Format (KeyOpFieldsValuesTuple)](#request-format-keyopfieldsvaluestuple)
+- [Communication Modes](#communication-modes)
+  - [ASYNC Mode](#async-mode-default-sai_redis_communication_mode_redis_async)
+  - [SYNC Mode](#sync-mode-sai_redis_communication_mode_redis_sync)
+- [Who Updates the HASH?](#who-updates-the-hash)
+- [Key Code Locations](#key-code-locations)
+  - [sonic-swss-common](#sonic-swss-common)
+  - [sonic-sairedis](#sonic-sairedis)
+  - [sonic-swss](#sonic-swss)
+- [Race Condition Handling](#race-condition-handling)
+  - [Scenario: SET followed by quick DEL](#scenario-set-followed-by-quick-del)
+  - [Scenario: Rapid attribute changes](#scenario-rapid-attribute-changes)
+- [Concrete Example: Port Admin State Set](#concrete-example-port-admin-state-set)
+  - [Step 1: User Configuration](#step-1-user-configuration)
+  - [Step 2: Orchagent Processing](#step-2-orchagent-processing)
+  - [Step 3: Sairedis Serialization](#step-3-sairedis-serialization)
+  - [Step 4: Push to Redis (ProducerTable)](#step-4-push-to-redis-producertable)
+  - [Step 5: Redis State After Push](#step-5-redis-state-after-push)
+  - [Step 6: Syncd Wakeup and Pop](#step-6-syncd-wakeup-and-pop)
+  - [Step 7: Syncd Command Dispatch](#step-7-syncd-command-dispatch)
+  - [Step 8: SAI API Call to Hardware](#step-8-sai-api-call-to-hardware)
+  - [Step 9: Final State](#step-9-final-state)
+  - [Complete Flow Diagram](#complete-flow-diagram)
+  - [Key Code Files in the Flow](#key-code-files-in-the-flow)
+- [Summary](#summary)
+
+---
+
 ## Overview
 
 The ASIC DB serves as the communication bridge between `orchagent` and `syncd` in SONiC. It uses a **hybrid mechanism** combining a request queue (Redis LIST) with pub/sub notifications for wakeup signals.
