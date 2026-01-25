@@ -249,17 +249,12 @@ sai_status_t RedisRemoteSaiInterface::waitForResponse(sai_common_api_t api)
 
 ### Recording Implications
 
-**Sync Mode sairedis.rec:**
-```
-2024-01-15.10:30:45.123456|c|SAI_OBJECT_TYPE_PORT:oid:0x1000000000001|SAI_PORT_ATTR_SPEED=100000
-2024-01-15.10:30:45.234567|C|SAI_STATUS_SUCCESS    ← Real response recorded
-```
+| Mode | Request Recorded? | Response Recorded? |
+|------|-------------------|-------------------|
+| Sync | Yes | Yes (real status) |
+| Async | Yes | **No** (assumed success) |
 
-**Async Mode sairedis.rec:**
-```
-2024-01-15.10:30:45.123456|c|SAI_OBJECT_TYPE_PORT:oid:0x1000000000001|SAI_PORT_ATTR_SPEED=100000
-                                                    ← NO response line!
-```
+See [Example Recording](#example-recording-sync-mode) for format details.
 
 ### Important: Syncd Always Writes Responses
 
@@ -557,13 +552,10 @@ It parses the recording file and re-executes all SAI operations, useful for:
 
 ## Important Notes
 
-1. **Client-Side Recording**: Recording happens in the orchagent process (via libsairedis), NOT in syncd
-2. **Thread Safety**: All recordings are mutex-protected for concurrent access
-3. **Performance**: Recording adds minimal overhead; each line is immediately flushed
-4. **Selective Recording**: Statistics operations can be disabled via `SAI_REDIS_SWITCH_ATTR_RECORD_STATS`
-5. **Skip Filtering**: Certain GET operations can be skipped via `SkipRecordAttrContainer`
-6. **Async Mode Limitation**: In async mode, response status is NOT recorded for create/set/remove operations
-7. **Syncd Always Responds**: Syncd writes responses regardless of client mode; async mode just doesn't read them
+1. **Recording Location**: Recording happens client-side in orchagent (via libsairedis), NOT in syncd
+2. **Selective Recording**: Stats operations can be disabled via `SAI_REDIS_SWITCH_ATTR_RECORD_STATS`
+3. **Skip Filtering**: Certain GET operations can be skipped via `SkipRecordAttrContainer` class
+4. **File Permissions**: Recording directory must be writable by orchagent process
 
 ## Debugging Tips
 
