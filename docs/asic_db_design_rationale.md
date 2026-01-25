@@ -557,6 +557,138 @@ end
 return results
 ```
 
+**Redis Streams Key Advantage: Recording Comes Free**
+
+Current design requires a separate `.rec` file mechanism for recording SAI operations. With Redis Streams, recording is a natural byproduct:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│            Current Design: 3 Components                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. Request channel:   LIST (orchagent → syncd)     - no recording         │
+│  2. Response channel:  GETRESPONSE key/Pub/Sub      - no recording         │
+│  3. Recording:         .rec file                    - EXTRA code/I/O       │
+│                                                                             │
+│  Recording is done by sairedis client (orchagent side):                    │
+│  • recordGenericCreate() → write to .rec file                              │
+│  • waitForResponse()                                                        │
+│  • recordGenericCreateResponse() → write to .rec file                      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│            Redis Streams Design: Recording is FREE                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. Request stream:    ASIC_REQUEST_STREAM          - persisted ✓          │
+│  2. Response stream:   ASIC_RESPONSE_STREAM         - persisted ✓          │
+│  3. Recording:         (built into streams)         - FREE!                │
+│                                                                             │
+│  ┌───────────┐                                          ┌───────────┐       │
+│  │ orchagent │───XADD req──►┌────────────────┐         │   syncd   │       │
+│  │           │              │ REQUEST_STREAM │◄─XREAD──│           │       │
+│  │           │              │ (persisted)    │         │           │       │
+│  │           │              └────────────────┘         │           │       │
+│  │           │                                         │           │       │
+│  │           │◄──XREAD─────┌────────────────┐◄─XADD───│           │       │
+│  │           │             │ RESPONSE_STREAM│          │           │       │
+│  │           │             │ (persisted)    │          │           │       │
+│  └───────────┘             └────────────────┘          └───────────┘       │
+│                                                                             │
+│  Both streams retain history = Complete recording for FREE!                │
+│  No separate Recorder class, no extra file I/O in critical path           │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Stream + Archiver Pattern for Long-term Storage**
+
+Streams cannot grow forever in Redis memory. Solution: bounded streams + background archiver:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│            Stream (Hot Data) + File (Cold Data) Architecture                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌───────────┐                                          ┌───────────┐       │
+│  │ orchagent │───XADD───►┌─────────────────────────────►│   syncd   │       │
+│  └───────────┘           │  REQUEST_STREAM              └───────────┘       │
+│                          │  (MAXLEN ~10000)                   │             │
+│  ┌───────────┐           │                                    │             │
+│  │ orchagent │◄──────────┼────────────────────────────XADD────┘             │
+│  └───────────┘           │  RESPONSE_STREAM                                 │
+│                          │  (MAXLEN ~10000)                                 │
+│                          │                                                  │
+│                          ▼                                                  │
+│                   ┌─────────────┐                                          │
+│                   │  Archiver   │  (background process)                    │
+│                   │  Process    │                                          │
+│                   │             │                                          │
+│                   │  • XREAD from both streams (continuous)                │
+│                   │  • Write to file before entries are trimmed           │
+│                   │  • Track last archived ID (checkpoint)                 │
+│                   │  • Survives archiver restart                          │
+│                   └──────┬──────┘                                          │
+│                          │                                                  │
+│                          ▼                                                  │
+│                   ┌─────────────┐                                          │
+│                   │   Files     │  Permanent storage                       │
+│                   │             │                                          │
+│                   │ sairedis_   │  • Log rotation (daily/size)            │
+│                   │ 2024-01-15  │  • Compression (gzip old files)         │
+│                   │ .rec        │  • Offline analysis (saiplayer)         │
+│                   └─────────────┘                                          │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Archiver Logic:**
+
+```python
+class StreamArchiver:
+    def __init__(self):
+        self.last_archived = self.load_checkpoint()  # Survives restart
+
+    def run(self):
+        while True:
+            # Read new entries since last archived
+            entries = redis.xread(
+                streams=["REQUEST_STREAM", "RESPONSE_STREAM"],
+                ids=[self.last_archived["req"], self.last_archived["rsp"]],
+                block=1000)
+
+            for entry in entries:
+                self.write_to_file(entry)          # Append to .rec file
+                self.last_archived[stream] = entry.id
+
+            self.save_checkpoint()                  # Persist progress
+
+            # Now safe to trim old entries
+            redis.xtrim("REQUEST_STREAM", maxlen=10000, approximate=True)
+            redis.xtrim("RESPONSE_STREAM", maxlen=10000, approximate=True)
+```
+
+**Handling Redis Restart:**
+
+| Scenario | With AOF Enabled | Without AOF |
+|----------|------------------|-------------|
+| Redis restarts | Stream entries survive (AOF replay) | Recent un-archived entries lost |
+| Archiver catches up | Resumes from checkpoint | Gap bounded by archive frequency |
+| Maximum data loss | ~1 second (appendfsync=everysec) | Time since last archive |
+
+**Comparison: Current .rec vs Stream + Archiver**
+
+| Aspect | Current (.rec inline) | Stream + Archiver |
+|--------|----------------------|-------------------|
+| **Recording I/O** | Inline (blocks main path) | Background (async) |
+| **Latency impact** | Adds file I/O latency | None |
+| **Query recent** | Parse file | XRANGE (fast) |
+| **Query historical** | Parse file | Parse archived file |
+| **Crash recovery** | Message lost after LIST pop | PEL retry (unacked) |
+| **Complexity** | Single process | Additional archiver |
+| **Separation of concerns** | Mixed | Clean separation |
+
 ### Option 3: Hybrid gRPC + Redis (Revised for Individual Restart)
 
 Given the verified requirement that individual docker restart MUST be supported, the hybrid design needs a fallback queue:
@@ -780,14 +912,17 @@ ZmqConsumerStateTable(db, tableName, zmqServer, popBatchSize, pri,
 | **Code complexity** | High (Lua) | Medium | Low ✓ | Medium | Medium | High |
 | **Existing in SONiC** | Yes ✓ | No | Yes (gNMI) | Yes ✓ | Partial | No |
 | **Multi-consumer** | No | Yes ✓ | Yes ✓ | No | Yes ✓ | No |
+| **Recording (.rec)** | Extra code/file | **FREE** ✓ | Extra code | Extra code | Extra code | Extra code |
+| **Crash recovery** | Lost after pop | PEL retry ✓ | N/A | N/A | Lost after pop | N/A |
 | **Individual docker restart** | ✓ Queue buffers | ✓ Stream buffers | ✗ FAILS | ✗ FAILS | ✓ Queue fallback | ✗ FAILS |
 
-**Critical Row: Individual Docker Restart Support**
+**Critical Rows Explained:**
 
-The last row is the deciding factor given verified SONiC requirements:
-- **Pure gRPC, ZMQ, and Shared Memory all FAIL** during syncd restart (no persistent buffering)
-- Any viable design **requires** persistent message buffering
-- ZMQ's optional `dbPersistence` writes to HASH only, not to a queue - doesn't help with restart
+1. **Recording (.rec)**: Redis Streams provides recording "for free" - both request and response streams persist and can be queried. Other designs need separate file-based recording.
+
+2. **Crash recovery**: If syncd crashes after popping from LIST but before SAI completes, message is lost. Redis Streams keeps messages in PEL (Pending Entries List) until XACK - allows retry on restart.
+
+3. **Individual docker restart**: The deciding factor - pure gRPC, ZMQ, and Shared Memory all FAIL during syncd restart (no persistent buffering). ZMQ's `dbPersistence` writes to HASH only, not queue.
 
 ---
 
@@ -933,12 +1068,22 @@ This requirement means **persistent message buffering is mandatory** - you canno
 
 ### If Designing Today
 
-The recommended approach is **gRPC + Redis Fallback Queue**:
+Two recommended approaches depending on priorities:
 
-1. **gRPC for primary communication** - Type-safe, bidirectional, low-latency
-2. **Redis LIST for fallback queue** - Buffers during syncd restart (REQUIRED)
+**Option A: Redis Streams (Simpler, Recording-friendly)**
+
+1. **Dual streams** - REQUEST_STREAM and RESPONSE_STREAM
+2. **Recording FREE** - Both streams persist, no separate .rec file needed
+3. **Crash recovery** - PEL (Pending Entries List) enables retry of unacked messages
+4. **Stream + Archiver** - Bounded memory, background archiving to files
+5. **Single primitive** - No separate Pub/Sub for wakeup (XREADGROUP BLOCK)
+
+**Option B: gRPC + Redis Fallback Queue (Lower latency)**
+
+1. **gRPC for primary communication** - Type-safe, bidirectional, ~10-50μs latency
+2. **Redis Stream/LIST for fallback** - Buffers during syncd restart (REQUIRED)
 3. **Redis HASH for state** - Warm boot recovery, debugging
-4. **Simpler Lua** - No complex atomic pop+HASH update (separated concerns)
+4. **Still need .rec file** - gRPC doesn't provide recording
 
 ### Why Not Pure gRPC or ZMQ?
 
@@ -970,14 +1115,27 @@ A common misconception is that modern designs should eliminate Redis entirely. H
 
 ### Final Assessment
 
-| Design | Normal Performance | Individual Restart | Recommended? |
-|--------|-------------------|-------------------|--------------|
-| Current (LIST+Pub/Sub) | Good | ✓ Supported | ✓ Proven |
-| ZMQ (Existing option) | Excellent | ✗ FAILS | ✗ No (same as gRPC) |
-| Pure gRPC | Excellent | ✗ FAILS | ✗ No |
-| gRPC + Redis Queue | Excellent | ✓ Supported | ✓ Best modern choice |
-| Redis Streams | Good | ✓ Supported | ✓ Alternative |
+| Design | Performance | Restart | Recording | Crash Recovery | Recommended? |
+|--------|-------------|---------|-----------|----------------|--------------|
+| Current (LIST+Pub/Sub) | Good | ✓ | Extra .rec | Lost after pop | ✓ Proven |
+| ZMQ (Existing) | Excellent | ✗ FAILS | Extra .rec | N/A | ✗ No |
+| Pure gRPC | Excellent | ✗ FAILS | Extra .rec | N/A | ✗ No |
+| gRPC + Redis Queue | Excellent | ✓ | Extra .rec | Lost after pop | ✓ Best latency |
+| **Redis Streams** | Good | ✓ | **FREE** | **PEL retry** | **✓ Best overall** |
 
-**Key Insight:** ZMQ and gRPC are equivalent in this analysis - both are direct communication mechanisms with built-in flow control (HWM vs HTTP/2 window) but **no persistence**. Both fail the individual docker restart requirement.
+**Key Insights:**
 
-The current design works well and is proven in production. If migrating, **gRPC + Redis Fallback Queue** provides better performance while maintaining the required restart resilience. Pure direct-communication solutions (gRPC, ZMQ) are **not viable** for SONiC's documented requirements without a persistent fallback queue.
+1. **ZMQ and gRPC** are equivalent - both have flow control but no persistence. Both fail individual docker restart.
+
+2. **Redis Streams advantages over current LIST+Pub/Sub:**
+   - Recording is FREE (dual streams persist request+response)
+   - Crash recovery via PEL (message stays until XACK)
+   - Single primitive (no separate Pub/Sub for wakeup)
+   - Built-in monitoring (XINFO, XPENDING)
+
+3. **Stream + Archiver pattern** handles long-term storage:
+   - Bounded stream size (XTRIM MAXLEN)
+   - Background archiver writes to files
+   - Redis AOF for persistence across restart
+
+**Recommendation for new SONiC-like system:** Redis Streams with dual streams (request + response) provides the best balance of features. Use gRPC + Redis Stream fallback if lowest latency is critical.
