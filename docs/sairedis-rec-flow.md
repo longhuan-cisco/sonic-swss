@@ -57,50 +57,58 @@ This document explains the end-to-end flow of how `sairedis.rec` gets written as
 │                 LIBSAIREDIS (Client SAI Library)                │
 │  ┌───────────────────────────────────────────────────────────┐  │
 │  │                 RedisRemoteSaiInterface                   │  │
-│  │  • Intercepts all SAI API calls                           │  │
-│  │  • Serializes object attributes                           │  │
-│  │  • Records to sairedis.rec via Recorder class ──────────────────┐
-│  │  • Sends commands to Redis ASIC_STATE table               │  │  │
-│  └───────────────────────────────────────────────────────────┘  │  │
-└─────────────────────────────────────────────────────────────────┘  │
-                               │                                     │
-                               │ Redis/ZMQ                           │
-                               ▼                                     │
-┌─────────────────────────────────────────────────────────────────┐  │
-│                      REDIS (ASIC_STATE_DB)                      │  │
-│   Stores SAI object state and serves as IPC                     │  │
-└─────────────────────────────────────────────────────────────────┘  │
-                               │                                     │
-                               │ SelectableChannel polling           │
-                               ▼                                     │
-┌─────────────────────────────────────────────────────────────────┐  │
-│                           SYNCD                                 │  │
-│   • Receives SAI commands from Redis                            │  │
-│   • Translates VID (Virtual ID) ↔ RID (Real ID)                 │  │
-│   • Calls actual hardware SAI SDK via VendorSai                 │  │
-└─────────────────────────────────────────────────────────────────┘  │
-                               │                                     │
-                               │ SAI API (vendor-specific)           │
-                               ▼                                     │
-┌─────────────────────────────────────────────────────────────────┐  │
-│                  HARDWARE SAI SDK (VendorSai)                   │  │
-│             (Broadcom, Mellanox, Marvell, etc.)                 │  │
-└─────────────────────────────────────────────────────────────────┘  │
-                               │                                     │
-                               ▼                                     │
-┌─────────────────────────────────────────────────────────────────┐  │
-│                        ASIC HARDWARE                            │  │
-│                   (Network switching silicon)                   │  │
-└─────────────────────────────────────────────────────────────────┘  │
-                                                                     │
-                    ┌────────────────────────────────────────────────┘
+│  │                                                           │  │
+│  │  1. Record REQUEST ────────────────────────────────────────────┐
+│  │  2. Send to Redis                                         │  │ │
+│  │  3. Wait for response (sync mode)                         │  │ │
+│  │  4. Record RESPONSE (sync mode only) ──────────────────────────┤
+│  │                                                           │  │ │
+│  └───────────────────────────────────────────────────────────┘  │ │
+└─────────────────────────────────────────────────────────────────┘ │
+                               │                                    │
+                               │ ASIC_STATE (Redis LIST)            │
+                               ▼                                    │
+┌─────────────────────────────────────────────────────────────────┐ │
+│                      REDIS (ASIC_DB)                            │ │
+│   • ASIC_STATE queue: orchagent → syncd (requests)              │ │
+│   • GETRESPONSE queue: syncd → orchagent (responses)            │ │
+└─────────────────────────────────────────────────────────────────┘ │
+                               │                                    │
+                               │ GETRESPONSE (Redis LIST)           │
+                               ▼                                    │
+┌─────────────────────────────────────────────────────────────────┐ │
+│                           SYNCD                                 │ │
+│   • Receives SAI commands from Redis                            │ │
+│   • Translates VID ↔ RID                                        │ │
+│   • Calls vendor SAI, returns response                          │ │
+└─────────────────────────────────────────────────────────────────┘ │
+                               │                                    │
+                               │ SAI API (vendor-specific)          │
+                               ▼                                    │
+┌─────────────────────────────────────────────────────────────────┐ │
+│                  HARDWARE SAI SDK (VendorSai)                   │ │
+│             (Broadcom, Mellanox, Marvell, etc.)                 │ │
+└─────────────────────────────────────────────────────────────────┘ │
+                               │                                    │
+                               ▼                                    │
+┌─────────────────────────────────────────────────────────────────┐ │
+│                        ASIC HARDWARE                            │ │
+│                   (Network switching silicon)                   │ │
+└─────────────────────────────────────────────────────────────────┘ │
+                                                                    │
+                    ┌───────────────────────────────────────────────┘
                     │
                     ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                        sairedis.rec                             │
-│   • Timestamp-prefixed log of all SAI operations                │
-│   • Format: YYYY-MM-DD.HH:MM:SS.microseconds|opcode|data        │
-│   • Located in configurable directory (default: .)              │
+│                                                                 │
+│   Records both REQUEST and RESPONSE (sync mode):                │
+│   ┌───────────────────────────────────────────────────────────┐ │
+│   │ timestamp|c|SAI_OBJECT_TYPE:oid|attr=val  ← request       │ │
+│   │ timestamp|C|SAI_STATUS_SUCCESS            ← response      │ │
+│   └───────────────────────────────────────────────────────────┘ │
+│                                                                 │
+│   Async mode: only REQUEST recorded (no response)               │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
