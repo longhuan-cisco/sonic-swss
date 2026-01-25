@@ -215,36 +215,38 @@ sai_status_t RedisRemoteSaiInterface::waitForResponse(sai_common_api_t api)
 ### Visual Flow Comparison
 
 ```
-                      SYNC MODE                              ASYNC MODE
-                      ─────────                              ──────────
-Orchagent             Orchagent
-    │                     │
-    ▼                     ▼
-create()              create()
-    │                     │
-    ▼                     ▼
-record request        record request
-    │                     │
-    ▼                     ▼
-send to Redis         send to Redis (buffered/pipelined)
-    │                     │
-    ▼                     ▼
-waitForResponse()     waitForResponse()
-    │                     │
-    ▼                     ▼
-┌─────────────────┐   ┌─────────────────┐
-│ m_syncMode=true │   │ m_syncMode=false│
-│                 │   │                 │
-│ BLOCK waiting   │   │ return SUCCESS  │◄── Fire and forget!
-│ for syncd...    │   │ immediately     │
-│                 │   │                 │
-│ record response │   │ (no recording)  │
-└────────┬────────┘   └─────────────────┘
-         │
-    [syncd processes, calls ASIC]
-         │
-         ▼
-    return REAL status
+         SYNC MODE                                     ASYNC MODE
+         ─────────                                     ──────────
+
+         Orchagent                                     Orchagent
+             │                                             │
+             ▼                                             ▼
+         create()                                      create()
+             │                                             │
+             ▼                                             ▼
+       record request                                record request
+             │                                             │
+             ▼                                             ▼
+       send to Redis                                 send to Redis (buffered/pipelined)
+             │                                             │
+             ▼                                             ▼
+     waitForResponse()                               waitForResponse()
+             │                                             │
+             ▼                                             ▼
+    ┌─────────────────┐                             ┌─────────────────┐
+    │ m_syncMode=true │                             │ m_syncMode=false│
+    │                 │                             │                 │
+    │ BLOCK waiting   │                             │ return SUCCESS  │◄── Fire and forget!
+    │ for syncd...    │                             │ immediately     │
+    │                 │                             │                 │
+    │ record response │                             │ (no recording)  │
+    └────────┬────────┘                             └─────────────────┘
+             │                                             │
+             ▼                                             ▼
+  [syncd processes, calls ASIC]                      return to caller
+             │                                       (assumes success)
+             ▼
+      return REAL status
 ```
 
 ### Recording Implications
