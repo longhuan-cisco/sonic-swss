@@ -2,6 +2,43 @@
 
 This document explains the end-to-end flow of how `sairedis.rec` gets written as part of the SONiC SAI SDK architecture.
 
+## Table of Contents
+
+- [Overview](#overview)
+- [Architecture Diagram](#architecture-diagram)
+- [Orchagent ↔ Syncd Communication Architecture](#orchagent--syncd-communication-architecture)
+  - [How ProducerTable/ConsumerTable Works](#how-producertableconsumertable-works)
+  - [Queue Summary](#queue-summary)
+- [Who Writes sairedis.rec?](#who-writes-sairedisrec)
+- [Communication Modes: Sync vs Async](#communication-modes-sync-vs-async)
+  - [Available Modes](#available-modes)
+  - [The Critical Difference: waitForResponse()](#the-critical-difference-waitforresponse)
+  - [Visual Flow Comparison](#visual-flow-comparison)
+  - [Recording Implications](#recording-implications)
+  - [Important: Syncd Always Writes Responses](#important-syncd-always-writes-responses)
+  - [Mode Configuration](#mode-configuration)
+  - [Trade-offs](#trade-offs)
+- [When Does Recording Happen?](#when-does-recording-happen)
+  - [1. Configuration Phase (Orchagent Startup)](#1-configuration-phase-orchagent-startup)
+  - [2. Recording Phase (Runtime)](#2-recording-phase-runtime)
+  - [3. Actual File Write](#3-actual-file-write)
+- [Threading Model and Performance](#threading-model-and-performance)
+  - [Recording Happens on Main Thread](#recording-happens-on-main-thread)
+  - [Why Synchronous Recording?](#why-synchronous-recording)
+  - [Blocking Cost per Recording](#blocking-cost-per-recording)
+  - [Why It's Usually Acceptable](#why-its-usually-acceptable)
+  - [When Recording Could Be A Problem](#when-recording-could-be-a-problem)
+  - [Disabling Recording for Performance](#disabling-recording-for-performance)
+- [Recording Format](#recording-format)
+  - [Operation Codes](#operation-codes)
+  - [Example Recording (Sync Mode)](#example-recording-sync-mode)
+- [Command-Line Configuration](#command-line-configuration)
+- [Log Rotation](#log-rotation)
+- [Replay Functionality (SaiPlayer)](#replay-functionality-saiplayer)
+- [Key Source Files](#key-source-files)
+- [Important Notes](#important-notes)
+- [Debugging Tips](#debugging-tips)
+
 ## Overview
 
 `sairedis.rec` is a recording file that captures **all SAI API calls** made by orchagent through the sairedis library. It serves as a comprehensive audit trail for debugging, troubleshooting hardware configuration issues, and replay testing.
