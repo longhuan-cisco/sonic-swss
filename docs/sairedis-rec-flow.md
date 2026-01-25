@@ -322,15 +322,94 @@ sai_status_t RedisRemoteSaiInterface::create(...) {
 The `Recorder::recordLine()` method in `Recorder.cpp:166-182` handles thread-safe writes:
 
 ```cpp
+// Recorder.cpp:23 - MUTEX is a blocking lock_guard
+#define MUTEX() std::lock_guard<std::mutex> _lock(m_mutex)
+
+// Recorder.cpp:166-182
 void Recorder::recordLine(const std::string& line) {
-    MUTEX();  // Thread-safe lock
+    MUTEX();  // Acquire lock (blocks if contention)
 
     if (!m_enabled) return;
 
     if (m_ofstream.is_open()) {
+        // Write + flush (std::endl forces flush)
         m_ofstream << getTimestamp() << "|" << line << std::endl;
     }
 }
+```
+
+## Threading Model and Performance
+
+### Recording Happens on Main Thread
+
+Recording is **synchronous and blocking** - it happens directly on orchagent's main thread:
+
+```
+Orchagent Main Thread
+         │
+         ▼
+    SAI API call (e.g., sai_port_api->create_port())
+         │
+         ▼
+    RedisRemoteSaiInterface::create()
+         │
+         ├──► m_recorder->recordGenericCreate()  ◄── BLOCKS (mutex + file I/O)
+         │
+         ├──► m_communicationChannel->set()      ◄── BLOCKS (Redis write)
+         │
+         └──► waitForResponse()                  ◄── BLOCKS (sync mode) or returns (async)
+         │
+         ├──► m_recorder->recordGenericCreateResponse()  ◄── BLOCKS (mutex + file I/O)
+         │
+         ▼
+    Return to orchagent
+```
+
+### Why Synchronous Recording?
+
+1. **Simplicity**: No async complexity, no background threads
+2. **Ordering**: Recording matches exact execution order
+3. **Crash Safety**: If crash occurs, last recorded line shows exactly where execution stopped
+
+### Blocking Cost per Recording
+
+| Operation | Typical Time |
+|-----------|--------------|
+| Mutex acquire (no contention) | ~nanoseconds |
+| `getTimestamp()` (gettimeofday + strftime) | ~1-2 μs |
+| File write + flush | ~10-100 μs (filesystem dependent) |
+| **Total per SAI call** | **~10-100 μs** |
+
+### Why It's Usually Acceptable
+
+- SAI calls to hardware (via syncd) take **milliseconds**
+- Recording overhead is typically <1% of total SAI call time
+- OS filesystem usually buffers writes even with `std::endl`
+
+### When Recording Could Be A Problem
+
+| Scenario | Impact |
+|----------|--------|
+| Slow filesystem (NFS, failing disk) | Significant delays |
+| Async mode bulk operations | Recording overhead becomes more visible (not waiting for syncd) |
+| High-frequency stats polling | Consider disabling stats recording |
+
+### Disabling Recording for Performance
+
+```bash
+# Disable all recording
+orchagent -r 0
+
+# Or at runtime via SAI attribute
+sai_attribute_t attr;
+attr.id = SAI_REDIS_SWITCH_ATTR_RECORD;
+attr.value.booldata = false;
+sai_switch_api->set_switch_attribute(gSwitchId, &attr);
+
+# Disable only stats recording (high frequency)
+attr.id = SAI_REDIS_SWITCH_ATTR_RECORD_STATS;
+attr.value.booldata = false;
+sai_switch_api->set_switch_attribute(gSwitchId, &attr);
 ```
 
 ## Recording Format
