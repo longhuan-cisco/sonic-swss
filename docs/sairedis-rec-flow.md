@@ -65,17 +65,17 @@ This document explains the end-to-end flow of how `sairedis.rec` gets written as
 │  │                                                           │  │ │
 │  └───────────────────────────────────────────────────────────┘  │ │
 └─────────────────────────────────────────────────────────────────┘ │
-                               │                                    │
-                               │ ASIC_STATE (Redis LIST)            │
-                               ▼                                    │
+                          │    ▲                                    │
+       request (ASIC_STATE)│    │ response (GETRESPONSE)            │
+                          ▼    │                                    │
 ┌─────────────────────────────────────────────────────────────────┐ │
 │                      REDIS (ASIC_DB)                            │ │
 │   • ASIC_STATE queue: orchagent → syncd (requests)              │ │
 │   • GETRESPONSE queue: syncd → orchagent (responses)            │ │
 └─────────────────────────────────────────────────────────────────┘ │
-                               │                                    │
-                               │ GETRESPONSE (Redis LIST)           │
-                               ▼                                    │
+                          │    ▲                                    │
+                          │    │ response                           │
+                          ▼    │                                    │
 ┌─────────────────────────────────────────────────────────────────┐ │
 │                           SYNCD                                 │ │
 │   • Receives SAI commands from Redis                            │ │
