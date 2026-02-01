@@ -1,8 +1,44 @@
 # Orchagent <-> GBSyncd Communication & Issues Analysis
 
+> Based on [sonic-net/sonic-swss @ `f39134c`](https://github.com/sonic-net/sonic-swss/tree/f39134cbb25b6cf27358437a88de6c55c6dc16a1)
+
+---
+
+## Table of Contents
+
+- [1. Communication Architecture](#1-communication-architecture)
+  - [1.1 Database Separation](#11-database-separation)
+  - [1.2 Context-Based Routing](#12-context-based-routing)
+  - [1.3 ASIC_STATE Hash Table Ownership](#13-asic_state-hash-table-ownership)
+  - [1.4 sairedis.rec Recording](#14-sairedisrec-recording)
+  - [1.5 gearsyncd vs gbsyncd](#15-gearsyncd-vs-gbsyncd)
+- [2. Port Lifecycle: NPU Port vs Gearbox Port](#2-port-lifecycle-npu-port-vs-gearbox-port)
+  - [2.1 Creation Order](#21-creation-order)
+  - [2.2 Gearbox Port Objects Created](#22-gearbox-port-objects-created)
+  - [2.3 Dependency Direction](#23-dependency-direction)
+  - [2.4 Deletion: Gearbox Ports Are NOT Cleaned Up](#24-deletion-gearbox-ports-are-not-cleaned-up)
+- [3. Sync Mode: Blocking Behavior](#3-sync-mode-blocking-behavior)
+- [4. SAI Call Timeout & Error Handling](#4-sai-call-timeout--error-handling)
+  - [4.1 Timeout Mechanism](#41-timeout-mechanism)
+  - [4.2 Retry Policy by SAI Status](#42-retry-policy-by-sai-status)
+  - [4.3 Two-Layer Retry for Port Deletion](#43-two-layer-retry-for-port-deletion)
+  - [4.4 handleSaiFailure Behavior](#44-handlesaifailure-behavior)
+  - [4.5 initGearboxPort Return Value Ignored](#45-initgearboxport-return-value-ignored)
+- [5. Debugging Mechanisms for Slow/Stuck SAI Calls](#5-debugging-mechanisms-for-slowstuck-sai-calls)
+- [6. Supervisord Monitoring](#6-supervisord-monitoring)
+  - [6.1 Configuration](#61-configuration)
+  - [6.2 Behavior on Missed Heartbeats](#62-behavior-on-missed-heartbeats)
+  - [6.3 What Actually Kills Orchagent](#63-what-actually-kills-orchagent)
+- [7. End-to-End Stuck/Timeout Scenario Timeline](#7-end-to-end-stucktimeout-scenario-timeline)
+- [8. Gearbox-Specific Timeout Consequences](#8-gearbox-specific-timeout-consequences)
+- [9. `config interface breakout` CLI — GB_ASIC_DB Verification Gap](#9-config-interface-breakout-cli--gb_asic_db-verification-gap)
+- [10. Summary of Identified Gaps](#10-summary-of-identified-gaps)
+
+---
+
 ## 1. Communication Architecture
 
-### Database Separation
+### 1.1 Database Separation
 
 Orchagent communicates with syncd and gbsyncd through **separate Redis databases** using the same SAI Redis library (libsairedis):
 
@@ -12,7 +48,7 @@ Orchagent communicates with syncd and gbsyncd through **separate Redis databases
 | Counters | `COUNTERS_DB` (index 2) | `GB_COUNTERS_DB` (index 10) |
 | Flex counters | `FLEX_COUNTER_DB` (index 5) | `GB_FLEX_COUNTER_DB` (index 11) |
 
-### Context-Based Routing
+### 1.2 Context-Based Routing
 
 Both syncd and gbsyncd use the **same SAI Redis request/response pattern** (ProducerTable on ASIC_STATE, Redis list for notifications), but routing is determined by `SAI_REDIS_SWITCH_ATTR_CONTEXT`:
 
@@ -21,7 +57,7 @@ Both syncd and gbsyncd use the **same SAI Redis request/response pattern** (Prod
 
 The `context_config.json` on the device maps each context ID to its syncd/gbsyncd instance.
 
-### ASIC_STATE Hash Table Ownership
+### 1.3 ASIC_STATE Hash Table Ownership
 
 The `ASIC_STATE` hash entries in both ASIC_DB and GB_ASIC_DB are written/deleted **exclusively by the server side** (syncd/gbsyncd), not by orchagent:
 
@@ -30,13 +66,13 @@ The `ASIC_STATE` hash entries in both ASIC_DB and GB_ASIC_DB are written/deleted
   - `createAsicObject()` → `m_dbAsic->hset(key, ...)`
   - `removeAsicObject()` → `m_dbAsic->del(key)`
 
-### sairedis.rec Recording
+### 1.4 sairedis.rec Recording
 
 Both syncd and gbsyncd SAI calls are recorded to the **same sairedis.rec file**. There is one global `Recorder::Instance()` singleton per orchagent process. Recording attributes are configured only on the main switch (`saihelper.cpp:346-389`); gearbox switches inherit the global recorder.
 
 To distinguish entries: correlate the **switch OID** in each recorded operation. Identify the gearbox switch OID from the `create_switch` call that has the gearbox `context_id`.
 
-### gearsyncd vs gbsyncd
+### 1.5 gearsyncd vs gbsyncd
 
 - **gearsyncd** (`sonic-swss/gearsyncd/`): a **config loader only** — reads gearbox config from ConfigDB, writes to APPL_DB, signals `GearboxConfigDone`. Not a SAI process.
 - **gbsyncd** (in `sonic-sairedis`): the actual SAI syncd process serving GB_ASIC_DB, analogous to syncd for ASIC_DB.
@@ -45,9 +81,9 @@ To distinguish entries: correlate the **switch OID** in each recorded operation.
 
 ## 2. Port Lifecycle: NPU Port vs Gearbox Port
 
-### Creation Order: NPU first, then Gearbox
+### 2.1 Creation Order
 
-Call chain in `portsorch.cpp`:
+NPU port is created first, then gearbox port. Call chain in `portsorch.cpp`:
 
 ```
 doPortTask (line 4301)
@@ -58,20 +94,20 @@ doPortTask (line 4301)
       -> initGearboxPort (line 4004) -- creates gearbox ports via sai_port_api->create_port(phyOid)
 ```
 
-### Gearbox Port Objects Created (in GB_ASIC_DB)
+### 2.2 Gearbox Port Objects Created
 
-Per interface, `initGearboxPort()` (`portsorch.cpp:9718-10017`) creates:
+Per interface, `initGearboxPort()` (`portsorch.cpp:9718-10017`) creates three objects in GB_ASIC_DB:
 - **System-side port** (`sai_port_api->create_port(&systemPort, phyOid, ...)` — line 9816)
 - **Line-side port** (`sai_port_api->create_port(&linePort, phyOid, ...)` — line 9924)
 - **Port connector** (`sai_port_api->create_port_connector(&connector, phyOid, ...)` — line 9948)
 
-### Dependency Direction
+### 2.3 Dependency Direction
 
-- **NPU port -> Gearbox port**: One-way. NPU port must exist first (gearbox init happens during `registerPort` after NPU port has `m_port_id`).
-- **Gearbox port -> NPU port**: No SAI-level reference. The gearbox ports are created independently within the PHY context.
+- **NPU port → Gearbox port**: One-way. NPU port must exist first (gearbox init happens during `registerPort` after NPU port has `m_port_id`).
+- **Gearbox port → NPU port**: No SAI-level reference. The gearbox ports are created independently within the PHY context.
 - **Correlation is administrative only**: orchagent links them via `Port.m_system_side_id`, `Port.m_line_side_id`, and `m_gearboxPortListLaneMap[npu_port_id] = (system_oid, line_oid)`.
 
-### Deletion: Gearbox Ports Are NOT Cleaned Up
+### 2.4 Deletion: Gearbox Ports Are NOT Cleaned Up
 
 The port DEL handler (`portsorch.cpp:5363-5449`) flow:
 
@@ -85,6 +121,8 @@ The port DEL handler (`portsorch.cpp:5363-5449`) flow:
 ```
 
 **Missing**: No `deinitGearboxPort()` — system-side port, line-side port, port_connector, and serdes objects in GB_ASIC_DB are **never removed**. The `m_gearboxPortListLaneMap` entry keyed by the old NPU port OID is also never erased.
+
+**Note**: Gearbox port existence is **NOT** a ref count blocker for NPU port deletion.
 
 **Consequence**: On gearbox platforms, every port breakout cycle **leaks gearbox SAI objects** in GB_ASIC_DB.
 
@@ -100,7 +138,7 @@ Orchagent is **single-threaded**. All SAI calls (to both syncd and gbsyncd) are 
 
 ## 4. SAI Call Timeout & Error Handling
 
-### Timeout Mechanism
+### 4.1 Timeout Mechanism
 
 `RedisChannel::wait()` / `ZeroMQChannel::wait()` has a **60-second default timeout** (`SAI_REDIS_DEFAULT_SYNC_OPERATION_RESPONSE_TIMEOUT`), configurable via `SAI_REDIS_SWITCH_ATTR_SYNC_OPERATION_RESPONSE_TIMEOUT`.
 
@@ -114,7 +152,7 @@ ZeroMQChannel:  SWSS_LOG_ERROR("zmq_poll timed out for: <command>")
                 -> returns SAI_STATUS_FAILURE
 ```
 
-### Retry Policy by SAI Status
+### 4.2 Retry Policy by SAI Status
 
 **For remove operations** (`handleSaiRemoveStatus` in `saihelper.cpp:652-693`):
 
@@ -135,29 +173,52 @@ ZeroMQChannel:  SWSS_LOG_ERROR("zmq_poll timed out for: <command>")
 | `SAI_STATUS_INSUFFICIENT_RESOURCES` / `TABLE_FULL` / `NO_MEMORY` | `task_need_retry` | **Yes** |
 | `SAI_STATUS_FAILURE` (timeout) | `task_failed` | **No** — task dropped |
 
-### Port Deletion Retry (ref count / object-in-use)
+### 4.3 Two-Layer Retry for Port Deletion
 
-Before even calling SAI, orchagent checks two conditions (`portsorch.cpp:5376-5397`):
-- `m_port_ref_count[alias] > 0` → `SWSS_LOG_WARN("Unable to remove port %s: ref count %u")` → retry
-- `bridge_port_oid != SAI_NULL_OBJECT_ID` → `SWSS_LOG_WARN("Cannot remove port as bridge port OID is present")` → retry
+Port deletion has two layers of retry, both with **no retry limit** (indefinite):
 
-If SAI returns `SAI_STATUS_OBJECT_IN_USE` (`portsorch.cpp:5432-5438`):
-- `SWSS_LOG_WARN("Failed to remove port %" PRIx64 ", as the object is in use")` → retry
+**Layer 1: Orchagent pre-checks (before SAI call)** — `portsorch.cpp:5376-5397`
 
-These retry indefinitely (no limit) — the task stays in `m_toSync`.
+Orchagent checks internal state before even calling SAI. If conditions aren't met, the task stays in `m_toSync` for the next orch loop iteration (~1s):
 
-**Note**: Gearbox port existence is **NOT** a ref count blocker for NPU port deletion.
+- `m_port_ref_count[alias] > 0`:
+  - `SWSS_LOG_WARN("Unable to remove port %s: ref count %u", ...)`
+  - Retry next cycle (other orchs like sub-interface/LAG still hold a reference)
+- `bridge_port_oid != SAI_NULL_OBJECT_ID`:
+  - `SWSS_LOG_WARN("Cannot remove port as bridge port OID is present %" PRIx64, ...)`
+  - Retry next cycle (port still in a VLAN; VLAN member removal hasn't completed)
 
-### handleSaiFailure Behavior (`saihelper.cpp:747-779`)
+**Layer 2: SAI returns OBJECT_IN_USE (after SAI call)** — `portsorch.cpp:5429-5438`
 
-On `SAI_STATUS_FAILURE` (timeout):
+If the pre-checks pass but the vendor SAI still has references (e.g., FDB entries, mirror sessions, routes):
+
+```cpp
+sai_status_t status = removePort(port_id);
+if (SAI_STATUS_SUCCESS != status)
+{
+    if (SAI_STATUS_OBJECT_IN_USE != status)
+    {
+        throw runtime_error("Delete port failed");  // fatal for other errors
+    }
+    SWSS_LOG_WARN("Failed to remove port %" PRIx64 ", as the object is in use", port_id);
+    it++;      // keep in queue
+    continue;  // retry next cycle
+}
+```
+
+Any **other** SAI error (including `SAI_STATUS_FAILURE` from timeout) on port removal triggers `throw runtime_error("Delete port failed")` → unhandled exception → orchagent crash → container restart.
+
+### 4.4 handleSaiFailure Behavior
+
+`saihelper.cpp:747-779` — triggered on `SAI_STATUS_FAILURE` (timeout) for non-port-removal SAI calls:
+
 1. Sets `gOrchUnhealthy = true`
 2. Logs: `"Encountered failure in <op> operation, SAI API: <api>, status: SAI_STATUS_FAILURE"`
 3. Publishes structured event: `"sai-operation-failure"`
 4. Triggers syncd dump via `SAI_REDIS_NOTIFY_SYNCD_INVOKE_DUMP`
-5. Does **NOT** abort (abort_on_failure = false for runtime operations)
+5. Does **NOT** abort (`abort_on_failure = false` for runtime operations)
 
-### initGearboxPort Return Value Ignored
+### 4.5 initGearboxPort Return Value Ignored
 
 `registerPort()` at line 4004:
 ```cpp
@@ -170,62 +231,41 @@ If gearbox port creation times out, orchagent proceeds as if the port is fine.
 
 ## 5. Debugging Mechanisms for Slow/Stuck SAI Calls
 
-### sairedis.rec Timestamps
-
-Each entry has microsecond precision: `YYYY-MM-DD.HH:MM:SS.microseconds|<data>`. In sync mode, gap between request (lowercase `c`/`s`/`r`) and response (uppercase `C`/`S`/`R`) shows exactly how long syncd/gbsyncd took. Correlate by switch OID to distinguish syncd vs gbsyncd.
-
-### TimerWatchdog (syncd/gbsyncd side)
-
-`sonic-sairedis/syncd/TimerWatchdog.cpp`: background thread monitoring each vendor SAI API call.
-- Default warning: **30 seconds** (configurable via syncd `-w` flag)
-- Logs: `"event '%s' took %ld ms to execute"` when exceeded
-- Logs: `"time span WD exceeded %ld ms for %s"` if still running (hung)
-- Fires in both syncd and gbsyncd (shared binary).
-
-### Sync Mode Response Timeout
-
-`RedisChannel::wait()` / `ZeroMQChannel::wait()`: **60 seconds** default.
-- Configurable via `SAI_REDIS_SWITCH_ATTR_SYNC_OPERATION_RESPONSE_TIMEOUT`
-- VOQ switch: 5x default; Fabric switch: 10x default
-
-### Orchagent Heartbeat
-
-`orchdaemon.cpp:1213-1229`: emits `<!--XSUPERVISOR:BEGIN-->heartbeat<!--XSUPERVISOR:END-->` to stdout every **10 seconds** (configurable via `-I` flag, read from `CONFIG_DB HEARTBEAT|orchagent`).
-
-### PerformanceIntervalTimer
-
-`sonic-sairedis/meta/PerformanceIntervalTimer.cpp`: tracks cumulative timing for bulk operations, logs after every 10,000 ops.
+| Mechanism | Location | Default Threshold | What It Does |
+|---|---|---|---|
+| **sairedis.rec timestamps** | `sonic-sairedis/lib/Recorder.cpp` | Always on | Microsecond-precision timestamps on every SAI call. Gap between request (lowercase `c`/`s`/`r`) and response (uppercase `C`/`S`/`R`) shows syncd/gbsyncd latency. Correlate by switch OID. |
+| **TimerWatchdog** | `sonic-sairedis/syncd/TimerWatchdog.cpp` | **30 seconds** (syncd `-w` flag) | Background thread in syncd/gbsyncd. Logs `"time span WD exceeded %ld ms for %s"` if call still running; `"event '%s' took %ld ms to execute"` on completion. Fires in both syncd and gbsyncd (shared binary). |
+| **Sync mode response timeout** | `sonic-sairedis/lib/RedisChannel.cpp` | **60 seconds** | `SAI_REDIS_DEFAULT_SYNC_OPERATION_RESPONSE_TIMEOUT`. Configurable via `SAI_REDIS_SWITCH_ATTR_SYNC_OPERATION_RESPONSE_TIMEOUT`. VOQ: 5x default; Fabric: 10x default. |
+| **Orchagent heartbeat** | `orchagent/orchdaemon.cpp:1213` | **10 seconds** (`-I` flag) | Emits `<!--XSUPERVISOR:BEGIN-->heartbeat<!--XSUPERVISOR:END-->` to stdout. Read from `CONFIG_DB HEARTBEAT\|orchagent`. |
+| **PerformanceIntervalTimer** | `sonic-sairedis/meta/PerformanceIntervalTimer.cpp` | Per 10,000 ops | Tracks cumulative timing for bulk operations. |
 
 ---
 
-## 6. Supervisord Monitoring: Alerting Only, No Kill on Stuck
+## 6. Supervisord Monitoring
 
-### Configuration
+### 6.1 Configuration
 
 - `sonic-buildimage/dockers/docker-orchagent/supervisord.conf.j2`: orchagent configured with `stdout_capture_maxbytes=1MB` (enables PROCESS_COMMUNICATION_STDOUT events)
 - `sonic-buildimage/dockers/docker-orchagent/watchdog_processes.j2`: lists `program:orchagent`
 - Event listener: `supervisor-proc-exit-listener-rs` listens for `PROCESS_STATE_EXITED`, `PROCESS_STATE_RUNNING`, `PROCESS_COMMUNICATION_STDOUT`
+- Alert threshold: **60 seconds** default (`ALERTING_INTERVAL_SECS = 60`), configurable via `CONFIG_DB HEARTBEAT|orchagent alert_interval` (in milliseconds)
 
-### Alert Threshold
-
-Default: **60 seconds** (`ALERTING_INTERVAL_SECS = 60`), configurable via `CONFIG_DB HEARTBEAT|orchagent alert_interval` (in milliseconds).
-
-### Behavior on Missed Heartbeats
+### 6.2 Behavior on Missed Heartbeats
 
 **Alerting only — NO kill:**
 - After 60s of no heartbeat: `WARNING: "Process 'orchagent' is stuck in namespace '...' (N minutes)."`
 - Warning repeats periodically
 - Orchagent is **not killed or restarted**
 
-### What Actually Kills Orchagent
+### 6.3 What Actually Kills Orchagent
 
 | Condition | Kill mechanism | Container restart? |
 |---|---|---|
 | Heartbeat missed (stuck on SAI) | **No kill** — syslog warning only | No |
 | SAI timeout (60s) | **No kill** — task dropped, `gOrchUnhealthy=true` | No |
-| `abort_on_failure=true` (init-time critical) | `abort()` in `handleSaiFailure` | Yes (PROCESS_STATE_EXITED → SIGTERM to supervisord) |
-| Unhandled exception / crash | Process exits | Yes (PROCESS_STATE_EXITED → SIGTERM to supervisord) |
+| `abort_on_failure=true` (init-time critical) | `abort()` in `handleSaiFailure` | Yes |
 | `throw runtime_error("Delete port failed")` (non-OBJECT_IN_USE SAI error on port delete) | Unhandled exception → crash | Yes |
+| Unhandled exception / segfault | Process exits | Yes |
 | OOM killer | Kernel kills process | Yes |
 
 When orchagent **exits** (any reason), the `supervisor-proc-exit-listener` detects `PROCESS_STATE_EXITED` and sends `SIGTERM` to the supervisord parent PID → kills the entire swss container → systemd restarts it.
@@ -264,10 +304,13 @@ T+60s    RedisChannel::wait() timeout fires:
          -> event "sai-operation-failure" published
          -> syncd dump triggered
 
-         Task processing:
-         -> task_failed -> task ERASED from m_toSync queue (gone forever)
+         Task processing (depends on operation type):
+         -> General SAI calls: task_failed -> task ERASED from m_toSync (gone forever)
+         -> Port removal specifically: throw runtime_error("Delete port failed") -> crash
+            -> PROCESS_STATE_EXITED -> SIGTERM to supervisord -> container restart
 
-T+60s+   Orchagent resumes main loop
+T+60s+   If orchagent did NOT crash:
+         Orchagent resumes main loop
          heartBeat() resumes -> stuck warning eventually clears
          Processes queued tasks again
          But: gOrchUnhealthy=true, failed task lost, potential orphaned/missing objects
@@ -346,3 +389,4 @@ In any future **async/pipeline mode**: this would be a real race condition.
 | Breakout CLI doesn't verify GB_ASIC_DB | False "deletion complete" signal on gearbox platforms | `config_mgmt.py:355-416` |
 | Stuck orchagent not killed by supervisord | Orchagent limps along unhealthy indefinitely | `supervisor-proc-exit-listener` |
 | SAI timeout → task dropped, no retry | Lost configuration requiring manual re-push | `saihelper.cpp:579-603` |
+| Port removal SAI timeout → crash | `throw runtime_error` on non-OBJECT_IN_USE error kills orchagent | `portsorch.cpp:5432-5434` |
