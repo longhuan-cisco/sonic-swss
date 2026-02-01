@@ -30,7 +30,8 @@
   - [6.2 Behavior on Missed Heartbeats](#62-behavior-on-missed-heartbeats)
   - [6.3 What Actually Kills Orchagent](#63-what-actually-kills-orchagent)
 - [7. End-to-End Stuck/Timeout Scenario Timeline](#7-end-to-end-stucktimeout-scenario-timeline)
-- [8. Gearbox-Specific Timeout Consequences](#8-gearbox-specific-timeout-consequences)
+- [8. Gearbox Port Creation Failure Consequences](#8-gearbox-port-creation-failure-consequences)
+  - [8.4 Contrast with NPU Port Creation](#84-contrast-with-npu-port-creation)
 - [9. `config interface breakout` CLI — GB_ASIC_DB Verification Gap](#9-config-interface-breakout-cli--gb_asic_db-verification-gap)
 - [10. Summary of Identified Gaps](#10-summary-of-identified-gaps)
 
@@ -335,17 +336,20 @@ T+60s+   If orchagent did NOT crash:
 
 ---
 
-## 8. Gearbox-Specific Timeout Consequences
+## 8. Gearbox Port Creation Failure Consequences
 
-### Full gearbox creation timeout
+Since `initGearboxPort()` return value is ignored (`portsorch.cpp:4004`), **any** SAI failure — whether timeout or a definitive error — results in orchagent silently continuing with a broken port. This is in contrast to NPU port creation, which calls `SWSS_LOG_THROW("PortsOrch bulk create failure")` on any SAI error, crashing orchagent immediately (fail-fast).
 
-- `initGearboxPort` return value ignored (`portsorch.cpp:4004`)
+The consequences below apply to both timeout and actual failure unless noted.
+
+### 8.1 Full gearbox creation failure (timeout or error)
+
 - `m_system_side_id = 0`, `m_line_side_id = 0` on Port object
 - NPU port appears operational; gearbox PHY has no path configured
 - **Traffic blackhole**: packets reach NPU but have no PHY-level forwarding through gearbox
 - Flex counter setup safely skipped (checks `if (p.m_system_side_id)`)
 
-### Partial gearbox creation timeout (system-side OK, line-side timeout)
+### 8.2 Partial gearbox creation failure (system-side OK, line-side fails)
 
 - `port.m_system_side_id` set, `port.m_line_side_id = 0`
 - System-side port exists in GB_ASIC_DB; line-side doesn't
@@ -353,12 +357,24 @@ T+60s+   If orchagent did NOT crash:
 - **Half-configured gearbox PHY**, no rollback of system-side port
 - Admin-state/FEC/speed changes via `setGearboxPortsAttr` apply to system-side only, silently skip line-side
 
-### Late completion by gbsyncd (after orchagent timeout)
+### 8.3 Late completion by gbsyncd — timeout-specific
 
-- gbsyncd may complete the operation after 60s timeout
+This consequence is **unique to timeout** and does not apply to definitive SAI failures:
+
+- gbsyncd may still be processing the request after orchagent's 60s timeout
+- gbsyncd completes the operation and writes the object to GB_ASIC_DB
 - Orchagent never received the OID → gearbox port is an **orphan** in GB_ASIC_DB
-- Subsequent operations not applied to orphaned gearbox port
-- On port deletion/breakout: orphaned objects never cleaned up
+- Subsequent operations (admin state, FEC, speed) not applied to orphaned gearbox port
+- On port deletion/breakout: orphaned objects never cleaned up (no `deinitGearboxPort`)
+
+### 8.4 Contrast with NPU port creation
+
+| Aspect | NPU port | Gearbox port |
+|---|---|---|
+| SAI failure handling | `SWSS_LOG_THROW` → crash → container restart (fail-fast) | Return value ignored → silent continue (fail-silent) |
+| Partial creation | Crash before proceeding with broken state | Proceeds with half-configured PHY |
+| Orphan on timeout | Possible but cleaned up by restart reconciliation | Persists indefinitely — no cleanup mechanism |
+| Traffic impact | No blackhole — port never becomes operational | Blackhole — NPU port operational, PHY not configured |
 
 ---
 
