@@ -413,13 +413,22 @@ In any future **async/pipeline mode**: this would be a real race condition.
 
 ## 10. Summary of Identified Gaps
 
+### Gearbox-specific gaps (not present in NPU/syncd flow)
+
+NPU port creation uses `SWSS_LOG_THROW` on any SAI failure (fail-fast → crash → container restart). The gearbox flow has no equivalent error handling:
+
+| Issue | Impact | Location | NPU/syncd flow comparison |
+|---|---|---|---|
+| No `deinitGearboxPort()` in port deletion | Gearbox SAI objects leaked in GB_ASIC_DB on every breakout | `portsorch.cpp:5363-5449` | NPU port: `removePort()` calls `sai_port_api->remove_port()` |
+| `initGearboxPort()` return value ignored | Silent failure, traffic blackhole on timeout or error | `portsorch.cpp:4004` | NPU port: `addPortBulk()` checks return → `SWSS_LOG_THROW` on failure |
+| No rollback on partial gearbox creation | Half-configured PHY, leaked system-side port | `portsorch.cpp:9718-10017` | NPU port: also no rollback, but crash prevents proceeding with broken state |
+| `m_gearboxPortListLaneMap` not cleaned on port delete | Memory leak | `portsorch.cpp:5440-5446` | NPU port: `m_portListLaneMap` is cleaned via `removePortFromLanesMap()` |
+| Breakout CLI doesn't verify GB_ASIC_DB | False "deletion complete" signal on gearbox platforms | `config_mgmt.py:355-416` | ASIC_DB is verified for NPU ports |
+
+### General gaps (affect both syncd and gbsyncd flows)
+
 | Issue | Impact | Location |
 |---|---|---|
-| No `deinitGearboxPort()` in port deletion | Gearbox SAI objects leaked in GB_ASIC_DB on every breakout | `portsorch.cpp:5363-5449` |
-| `initGearboxPort()` return value ignored | Silent failure, traffic blackhole on gearbox timeout | `portsorch.cpp:4004` |
-| No rollback on partial gearbox creation | Half-configured PHY, leaked system-side port | `portsorch.cpp:9718-10017` |
-| `m_gearboxPortListLaneMap` not cleaned on port delete | Memory leak | `portsorch.cpp:5440-5446` |
-| Breakout CLI doesn't verify GB_ASIC_DB | False "deletion complete" signal on gearbox platforms | `config_mgmt.py:355-416` |
 | Stuck orchagent not killed by supervisord | Orchagent limps along unhealthy indefinitely | `supervisor-proc-exit-listener` |
 | SAI timeout → task dropped, no retry | Lost configuration requiring manual re-push | `saihelper.cpp:579-603` |
 | Port removal SAI timeout → crash | `throw runtime_error` on non-OBJECT_IN_USE error kills orchagent | `portsorch.cpp:5432-5434` |
