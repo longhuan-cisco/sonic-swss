@@ -208,6 +208,12 @@ if (SAI_STATUS_SUCCESS != status)
 
 Any **other** SAI error (including `SAI_STATUS_FAILURE` from timeout) on port removal triggers `throw runtime_error("Delete port failed")` → unhandled exception → orchagent crash → container restart.
 
+Note: `removePort()` (`portsorch.cpp:3833-3881`) returns the raw `sai_status_t` from `sai_port_api->remove_port()` directly — it does **not** go through `handleSaiRemoveStatus`. The caller's only special case is `OBJECT_IN_USE`.
+
+Additionally, `removePort()` calls `setPortAdminStatus(port, false)` (line 3846) **before** the actual `remove_port`. If that SAI call also times out, there could be **two** consecutive 60s timeouts (admin-down + remove) totaling ~120s of blocking before the crash.
+
+This crash path currently only applies to **NPU port removal** (syncd), since gearbox ports are never removed today. If a `deinitGearboxPort()` were added with similar throw-on-failure logic, gbsyncd timeouts would also trigger crashes.
+
 ### 4.4 handleSaiFailure Behavior
 
 `saihelper.cpp:747-779` — triggered on `SAI_STATUS_FAILURE` (timeout) for non-port-removal SAI calls:
