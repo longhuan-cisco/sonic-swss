@@ -425,11 +425,18 @@ NPU port creation uses `SWSS_LOG_THROW` on any SAI failure (fail-fast → crash 
 | `m_gearboxPortListLaneMap` not cleaned on port delete | Memory leak | `portsorch.cpp:5440-5446` | NPU port: `m_portListLaneMap` is cleaned via `removePortFromLanesMap()` |
 | Breakout CLI doesn't verify GB_ASIC_DB | False "deletion complete" signal on gearbox platforms | `config_mgmt.py:355-416` | ASIC_DB is verified for NPU ports |
 
-### General gaps (affect both syncd and gbsyncd flows)
+### General gaps
 
-| Issue | Impact | Location |
+| Issue | Impact | Scope | Location |
+|---|---|---|---|
+| Stuck orchagent not killed by supervisord | Orchagent limps along unhealthy indefinitely | Both syncd and gbsyncd | `supervisor-proc-exit-listener` |
+| SAI timeout → task dropped silently, no retry | Lost configuration requiring manual re-push | General SAI calls (routes, neighbors, ACLs, FDB, etc.) via `handleSai*Status`. Also applies to gearbox port create (return value ignored), and would apply to gearbox port delete if added in the future — since `initGearboxPort` doesn't use `SWSS_LOG_THROW` or `throw runtime_error` | `saihelper.cpp:579-603`, `portsorch.cpp:4004` |
+
+### NPU port create/delete timeout — handled via crash/restart/reconcile (not a silent-drop gap)
+
+NPU port create/delete timeouts cause orchagent to crash, which triggers container restart and state reconciliation. This is disruptive (all ports/services affected during restart) but not a silent data loss — the system recovers:
+
+| Scenario | Mechanism | Location |
 |---|---|---|
-| Stuck orchagent not killed by supervisord | Orchagent limps along unhealthy indefinitely | `supervisor-proc-exit-listener` |
-| SAI timeout → task dropped, no retry (general case: routes, neighbors, ACLs, FDB, etc. — any call going through `handleSai*Status`) | Lost configuration requiring manual re-push | `saihelper.cpp:579-603` |
-| NPU port creation SAI timeout → crash | `SWSS_LOG_THROW` kills orchagent | `portsorch.cpp:1390` |
-| NPU port removal SAI timeout → crash | `throw runtime_error` on non-OBJECT_IN_USE error kills orchagent | `portsorch.cpp:5432-5434` |
+| NPU port creation SAI timeout | `SWSS_LOG_THROW` → crash → container restart → reconcile | `portsorch.cpp:1390` |
+| NPU port removal SAI timeout | `throw runtime_error` → crash → container restart → reconcile | `portsorch.cpp:5432-5434` |
