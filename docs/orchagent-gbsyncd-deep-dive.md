@@ -214,11 +214,12 @@ Additionally, `removePort()` calls `setPortAdminStatus(port, false)` (line 3846)
 
 Note that this `setPortAdminStatus(false)` inside `removePort()` is a **safety net**, not a functional step for dependency cleanup. By the time execution reaches `removePort()`, the ref count check (Layer 1) has already passed, meaning:
 
-1. The port was already shut down earlier (e.g., CLI `config interface shutdown` during breakout)
-2. BGP saw the link-down event and withdrew routes
-3. `fpmsyncd`/`routeorch` removed routes from APP_DB/ASIC_DB
-4. Other orchs (VLAN, ACL, LAG, etc.) cleaned up their references
-5. `m_port_ref_count` reached 0
+1. The breakout CLI wrote `{"admin_status": "down"}` directly to CONFIG_DB (`config_mgmt.py:608`, `_shutdownIntf()`)
+2. Orchagent processed the config update and set admin state down via SAI
+3. BGP saw the link-down event and withdrew routes
+4. `fpmsyncd`/`routeorch` removed routes from APP_DB/ASIC_DB
+5. Other orchs (VLAN, ACL, LAG, etc.) cleaned up their references
+6. `m_port_ref_count` reached 0
 
 The admin-down in `removePort()` does **not** trigger any new BGP withdrawal or ref count reduction — that already happened upstream. It simply ensures the ASIC stops forwarding on this port before the SAI object is destroyed.
 
