@@ -212,6 +212,16 @@ Note: `removePort()` (`portsorch.cpp:3833-3881`) returns the raw `sai_status_t` 
 
 Additionally, `removePort()` calls `setPortAdminStatus(port, false)` (line 3846) **before** the actual `remove_port`. If that SAI call also times out, there could be **two** consecutive 60s timeouts (admin-down + remove) totaling ~120s of blocking before the crash.
 
+Note that this `setPortAdminStatus(false)` inside `removePort()` is a **safety net**, not a functional step for dependency cleanup. By the time execution reaches `removePort()`, the ref count check (Layer 1) has already passed, meaning:
+
+1. The port was already shut down earlier (e.g., CLI `config interface shutdown` during breakout)
+2. BGP saw the link-down event and withdrew routes
+3. `fpmsyncd`/`routeorch` removed routes from APP_DB/ASIC_DB
+4. Other orchs (VLAN, ACL, LAG, etc.) cleaned up their references
+5. `m_port_ref_count` reached 0
+
+The admin-down in `removePort()` does **not** trigger any new BGP withdrawal or ref count reduction — that already happened upstream. It simply ensures the ASIC stops forwarding on this port before the SAI object is destroyed.
+
 This crash path currently only applies to **NPU port removal** (syncd), since gearbox ports are never removed today. If a `deinitGearboxPort()` were added with similar throw-on-failure logic, gbsyncd timeouts would also trigger crashes.
 
 ### 4.4 handleSaiFailure Behavior
