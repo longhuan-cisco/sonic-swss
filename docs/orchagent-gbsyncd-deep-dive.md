@@ -1,4 +1,4 @@
-# Orchagent <-> GBSyncd Communication & Issues Analysis
+# Orchagent <-> Syncd/GBSyncd: Communication, Lifecycle, Timeout & Failure Analysis
 
 > Based on [sonic-net/sonic-swss @ `f39134c`](https://github.com/sonic-net/sonic-swss/tree/f39134cbb25b6cf27358437a88de6c55c6dc16a1)
 
