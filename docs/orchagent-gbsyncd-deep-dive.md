@@ -430,5 +430,6 @@ NPU port creation uses `SWSS_LOG_THROW` on any SAI failure (fail-fast → crash 
 | Issue | Impact | Location |
 |---|---|---|
 | Stuck orchagent not killed by supervisord | Orchagent limps along unhealthy indefinitely | `supervisor-proc-exit-listener` |
-| SAI timeout → task dropped, no retry | Lost configuration requiring manual re-push | `saihelper.cpp:579-603` |
-| Port removal SAI timeout → crash | `throw runtime_error` on non-OBJECT_IN_USE error kills orchagent | `portsorch.cpp:5432-5434` |
+| SAI timeout → task dropped, no retry (general case: routes, neighbors, ACLs, FDB, etc. — any call going through `handleSai*Status`) | Lost configuration requiring manual re-push | `saihelper.cpp:579-603` |
+| NPU port creation SAI timeout → crash | `SWSS_LOG_THROW` kills orchagent | `portsorch.cpp:1390` |
+| NPU port removal SAI timeout → crash | `throw runtime_error` on non-OBJECT_IN_USE error kills orchagent | `portsorch.cpp:5432-5434` |
