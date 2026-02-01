@@ -242,6 +242,13 @@ T+0s     Orchagent makes sync SAI call (e.g., create_port to gbsyncd)
 
 T+10s    First missed heartbeat emission
 
+T+30s    syncd/gbsyncd TimerWatchdog fires (default 30s threshold):
+         ERROR: "time span WD exceeded 30000 ms for <SAI_API_call>"
+         (This means the vendor SAI call is STILL running on the syncd/gbsyncd side)
+         If the call eventually completes after this warning:
+         ERROR: "event '<SAI_API_call>' took <N> ms to execute"
+         (These messages appear in syncd/gbsyncd syslog, not orchagent syslog)
+
 T+60s    supervisor-proc-exit-listener:
          WARNING: "Process 'orchagent' is stuck in namespace '...' (1 minutes)."
          (No kill — alerting only)
